@@ -206,8 +206,16 @@ def plot_devices(
     axes_list[-1].set_xlabel("time")
     axes_list[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
 
-    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
-    fig.autofmt_xdate()
+    subplot_params = dict(
+        left=0.03,
+        bottom=0.1,
+        right=0.97,
+        top=0.97,
+        wspace=0.2,
+        hspace=0.2,
+    )
+    fig.subplots_adjust(**subplot_params)
+    fig.autofmt_xdate(bottom=subplot_params["bottom"])
     plt.show(block=block)
 
 
