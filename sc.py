@@ -11,9 +11,19 @@ from datetime import datetime
 CSV_FILE_PATH = "/mnt/c/Users/DSavkovic/Downloads/SC/20260103105034.csv"
 
 
-# `time` is the axis we use for all plots. Support two formats so microseconds remain optional.
+# `time` is the axis we use for all plots. Support multiple formats so microseconds remain optional.
 TIME_COLUMN = "time"
-TIME_FORMATS = ("%m/%d/%Y %H:%M:%S.%f", "%m/%d/%Y %H:%M:%S")
+TIME_FORMATS = (
+    "%m/%d/%Y %H:%M:%S.%f",
+    "%m/%d/%Y %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+)
+
+def is_header_row(row: Dict[str, str]) -> bool:
+    time_value = row.get(TIME_COLUMN, "")
+    return isinstance(time_value, str) and time_value.strip().lower() == TIME_COLUMN.lower()
+
 
 COLUMNS = {
     "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),
@@ -38,14 +48,30 @@ def parse_timestamp(value: str, row_index: int) -> datetime:
 def parse_csv_file(csv_path: Path | str) -> Dict[str, List[Dict[str, str]]]:
     """Return rows grouped by DeviceName so callers can access data per device, sorted by time."""
 
-    path = Path(csv_path).expanduser()
+    return _parse_tabular_file(csv_path, delimiter=",")
+
+
+def parse_tsv_file(tsv_path: Path | str) -> Dict[str, List[Dict[str, str]]]:
+    """Return rows grouped by DeviceName so callers can access data per device, sorted by time."""
+
+    return _parse_tabular_file(tsv_path, delimiter="\t")
+
+
+def _parse_tabular_file(
+    path_arg: Path | str,
+    *,
+    delimiter: str,
+) -> Dict[str, List[Dict[str, str]]]:
+    path = Path(path_arg).expanduser()
     if not path.is_file():
-        raise FileNotFoundError(f"CSV file not found: {path}")
+        raise FileNotFoundError(f"Input file not found: {path}")
 
     with path.open(newline="", encoding="utf-8-sig") as fp:
-        reader = csv.DictReader(fp)
+        reader = csv.DictReader(fp, delimiter=delimiter)
         devices: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         for row in reader:
+            if is_header_row(row):
+                continue
             device = row.get("DeviceName")
             if device is None:
                 raise KeyError("CSV is missing the required 'DeviceName' column")
@@ -186,11 +212,12 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    rows_by_device = parse_csv_file(args.file)
+    # rows_by_device = parse_csv_file(args.file)
+    rows_by_device = parse_tsv_file(args.file)
     total_rows = sum(len(rows) for rows in rows_by_device.values())
     print(f"Parsed {total_rows} rows from {args.file}")
-    for device, rows in rows_by_device.items():
-        print(f"Device {device}: {len(rows)} rows")
+    # for device, rows in rows_by_device.items():
+    #     print(f"Device {device}: {len(rows)} rows")
     if rows_by_device:
         plot_devices(
             rows_by_device,
