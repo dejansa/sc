@@ -148,8 +148,7 @@ def plot_devices(
     axes_list[-1].set_xlabel("time")
     axes_list[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
 
-    fig.suptitle(title or " / ".join(group.upper() for group in column_groups))
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
     fig.autofmt_xdate()
     plt.show(block=block)
 
