@@ -32,7 +32,7 @@ $ pipx upgrade-all
 ❯ scx --help
 usage: scx [-h] [-g GROUP] [-ma MA_WINDOW] [file]
 
-Read CSV data for SC script
+Plot SC sensor export (TSV/CSV) traces by column group
 
 positional arguments:
   file                  Path to the CSV file to parse

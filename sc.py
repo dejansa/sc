@@ -232,7 +232,7 @@ def parse_group_list(value: str) -> List[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read CSV data for SC script")
+    parser = argparse.ArgumentParser(description="Plot SC sensor export (TSV/CSV) traces by column group")
     parser.add_argument(
         "file",
         nargs="?",
