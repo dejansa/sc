@@ -187,7 +187,7 @@ def plot_devices(
             for column in columns_map[group]:
                 column_values = column_data[group][column]
                 ax.plot(timestamps, column_values, label=column)
-                if column_values:
+                if ma_window >= 2 and column_values:
                     ma_values = compute_moving_average(column_values, ma_window)
                     ax.plot(
                         timestamps,
@@ -235,9 +235,10 @@ def parse_args() -> argparse.Namespace:
         "-g",
         "--group",
         default="acc",
-        help="Comma-separated column groups to visualize (default: %(default)s)",
+        help="Comma-separated column groups to visualize (valid: acc, as, ang, h; default: %(default)s)",
     )
     parser.add_argument(
+        "-ma",
         "--ma-window",
         type=int,
         default=5,
