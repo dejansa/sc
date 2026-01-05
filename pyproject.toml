@@ -1,0 +1,12 @@
+[project]
+name = "sc"
+version = "0.1.0"
+description = "Sensor chart viewing utility"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+sc = "sc:main"

@@ -257,14 +257,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-if __name__ == "__main__":
+def main() -> None:
     args = parse_args()
-    # rows_by_device = parse_csv_file(args.file)
     rows_by_device = parse_tsv_file(args.file)
-    total_rows = sum(len(rows) for rows in rows_by_device.values())
-    print(f"Parsed {total_rows} rows from {args.file}")
-    # for device, rows in rows_by_device.items():
-    #     print(f"Device {device}: {len(rows)} rows")
+    # total_rows = sum(len(rows) for rows in rows_by_device.values())
+    # print(f"Parsed {total_rows} rows from {args.file}")
     if rows_by_device:
         plot_devices(
             rows_by_device,
@@ -274,4 +271,8 @@ if __name__ == "__main__":
             ma_window=args.ma_window,
         )
         plt.show()
+
+
+if __name__ == "__main__":
+    main()
 
