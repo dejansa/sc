@@ -9,4 +9,4 @@ dependencies = [
 ]
 
 [project.scripts]
-sc = "sc:main"
+scx = "sc:main"

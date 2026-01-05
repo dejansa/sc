@@ -163,7 +163,7 @@ def plot_devices(
     if not rows_by_device:
         raise ValueError("No device data available for plotting")
 
-    if ma_window <= 0:
+    if ma_window < 0:
         raise ValueError("ma_window must be a positive integer")
 
     columns_map = {group: COLUMNS[group] for group in column_groups}
