@@ -126,12 +126,30 @@ def collect_group_data(
     return timestamps, column_data
 
 
+def compute_moving_average(values: List[float], window: int) -> List[float]:
+    """Return the simple moving average for the most recent `window` values."""
+
+    if window <= 0:
+        raise ValueError("ma_window must be a positive integer")
+
+    averages: List[float] = []
+    running_sum = 0.0
+    for index, value in enumerate(values):
+        running_sum += value
+        if index >= window:
+            running_sum -= values[index - window]
+        window_size = min(window, index + 1)
+        averages.append(running_sum / window_size)
+    return averages
+
+
 def plot_devices(
     rows_by_device: Dict[str, List[Dict[str, str]]],
     column_groups: List[str],
     title: str | None = None,
     *,
     block: bool = True,
+    ma_window: int = 5,
 ) -> None:
     if not column_groups:
         raise ValueError("At least one column group must be specified for plotting")
@@ -144,6 +162,9 @@ def plot_devices(
 
     if not rows_by_device:
         raise ValueError("No device data available for plotting")
+
+    if ma_window <= 0:
+        raise ValueError("ma_window must be a positive integer")
 
     columns_map = {group: COLUMNS[group] for group in column_groups}
     n_devices = len(rows_by_device)
@@ -164,7 +185,18 @@ def plot_devices(
             axis_idx = device_idx * len(column_groups) + group_idx
             ax = axes_list[axis_idx]
             for column in columns_map[group]:
-                ax.plot(timestamps, column_data[group][column], label=column)
+                column_values = column_data[group][column]
+                ax.plot(timestamps, column_values, label=column)
+                if column_values:
+                    ma_values = compute_moving_average(column_values, ma_window)
+                    ax.plot(
+                        timestamps,
+                        ma_values,
+                        label=f"{column} MA ({ma_window})",
+                        linestyle="--",
+                        linewidth=1.25,
+                        alpha=0.85,
+                    )
             alias = alias_map[device]
             ax.set_title(f"{alias} — {group.upper()}")
             ax.set_ylabel("Sensor value")
@@ -205,6 +237,12 @@ def parse_args() -> argparse.Namespace:
         default="acc",
         help="Comma-separated column groups to visualize (default: %(default)s)",
     )
+    parser.add_argument(
+        "--ma-window",
+        type=int,
+        default=5,
+        help="Simple moving average window size per signal (default: %(default)s)",
+    )
     args = parser.parse_args()
     args.groups = parse_group_list(args.group)
     return args
@@ -224,6 +262,7 @@ if __name__ == "__main__":
             column_groups=args.groups,
             title=f"{'/'.join(group.upper() for group in args.groups)} traces",
             block=False,
+            ma_window=args.ma_window,
         )
         plt.show()
 
