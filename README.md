@@ -9,7 +9,7 @@ Simple command-line utility for plotting sensor data from SC export files.
 $ uv tool install git+ssh://git@github.com:dejansa/sc.git
 
 # To upgrade to latest version run:
-$ uv tool upgrade asak
+$ uv tool upgrade sc
 # or
 $ uv tool upgrade --all
 ```
@@ -19,7 +19,7 @@ $ uv tool upgrade --all
 $ pipx install git+ssh://git@github.com:dejansa/sc.git
 
 # To upgrade to latest version run:
-$ pipx upgrade asak
+$ pipx upgrade sc
 
 # or
 
