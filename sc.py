@@ -235,9 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot SC sensor export (TSV/CSV) traces by column group")
     parser.add_argument(
         "file",
-        nargs="?",
-        default=CSV_FILE_PATH,
-        help="Path to the CSV file to parse",
+        help="Path to the CSV or TSV file to parse",
     )
     parser.add_argument(
         "-g",
