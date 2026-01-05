@@ -131,6 +131,7 @@ def plot_devices(
     )
     axes_list = [axis[0] for axis in axes]
 
+    alias_map = {device: f"sensor{idx + 1}" for idx, device in enumerate(rows_by_device)}
     for device_idx, (device, rows) in enumerate(rows_by_device.items()):
         timestamps, column_data = collect_group_data(rows, column_groups, columns_map)
         for group_idx, group in enumerate(column_groups):
@@ -138,7 +139,8 @@ def plot_devices(
             ax = axes_list[axis_idx]
             for column in columns_map[group]:
                 ax.plot(timestamps, column_data[group][column], label=column)
-            ax.set_title(f"{device} — {group.upper()}")
+            alias = alias_map[device]
+            ax.set_title(f"{alias} — {group.upper()}")
             ax.set_ylabel("Sensor value")
             ax.grid(True)
             ax.legend(loc="upper right")
