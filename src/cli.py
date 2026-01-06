@@ -1,8 +1,10 @@
 import argparse
 import csv
+import tomllib
 from collections import defaultdict
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -19,6 +21,24 @@ TIME_FORMATS = (
     "%Y-%m-%d %H:%M:%S.%f",
     "%Y-%m-%d %H:%M:%S",
 )
+
+PACKAGE_NAME = "sc"
+
+
+def _version_from_pyproject() -> Optional[str]:
+    try:
+        pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        with pyproject_path.open("rb") as fp:
+            data = tomllib.load(fp)
+        return data["project"]["version"]
+    except (FileNotFoundError, KeyError):
+        return None
+
+
+try:
+    PACKAGE_VERSION = version(PACKAGE_NAME)
+except PackageNotFoundError:
+    PACKAGE_VERSION = _version_from_pyproject() or "0.0.0"
 
 def is_header_row(row: Dict[str, str]) -> bool:
     time_value = row.get(TIME_COLUMN, "")
@@ -242,6 +262,13 @@ def parse_args() -> argparse.Namespace:
         "--group",
         default="acc",
         help="Comma-separated column groups to visualize (valid: acc, as, ang, h; default: %(default)s)",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=PACKAGE_VERSION,
+        help="Show the installed package version",
     )
     parser.add_argument(
         "-ma",
