@@ -48,9 +48,16 @@ def is_header_row(row: Dict[str, str]) -> bool:
 COLUMNS = {
     "ang": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),
     "angc": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # correct angZ for wrap-around
+    "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
     "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)")
+}
+
+ANGLE_COLORS = {
+    "AngleX(°)": "blue",
+    "AngleY(°)": "green",
+    "AngleZ(°)": "magenta",
 }
 
 
@@ -140,7 +147,7 @@ def collect_group_data(
                     )
                 try:
                     numeric_value = float(value)
-                    if group == "angc" and column == "AngleZ(°)" and numeric_value <= 0.1:
+                    if group in {"angc", "angd"} and column == "AngleZ(°)" and numeric_value <= 0.1:
                         numeric_value += 360
                     column_data[group][column].append(numeric_value)
                 except ValueError as exc:
@@ -190,9 +197,11 @@ def plot_devices(
     if ma_window < 0:
         raise ValueError("ma_window must be a positive integer")
 
-    columns_map = {group: COLUMNS[group] for group in column_groups}
+    has_angd = "angd" in column_groups
+    base_groups = [group for group in column_groups if group != "angd"]
+    columns_map = {group: COLUMNS[group] for group in base_groups}
     n_devices = len(rows_by_device)
-    total_axes = n_devices * len(column_groups)
+    total_axes = n_devices * len(base_groups) + (1 if has_angd else 0)
     fig, axes = plt.subplots(
         total_axes,
         1,
@@ -204,19 +213,21 @@ def plot_devices(
 
     alias_map = {device: f"sensor{idx + 1}" for idx, device in enumerate(rows_by_device)}
     for device_idx, (device, rows) in enumerate(rows_by_device.items()):
-        timestamps, column_data = collect_group_data(rows, column_groups, columns_map)
-        for group_idx, group in enumerate(column_groups):
-            axis_idx = device_idx * len(column_groups) + group_idx
+        timestamps, column_data = collect_group_data(rows, base_groups, columns_map)
+        for group_idx, group in enumerate(base_groups):
+            axis_idx = device_idx * len(base_groups) + group_idx
             ax = axes_list[axis_idx]
             for column in columns_map[group]:
                 column_values = column_data[group][column]
-                ax.plot(timestamps, column_values, label=column)
+                plot_color = ANGLE_COLORS.get(column) if group in {"ang", "angc"} else None
+                ax.plot(timestamps, column_values, label=column, color=plot_color)
                 if ma_window >= 2 and column_values:
                     ma_values = compute_moving_average(column_values, ma_window)
                     ax.plot(
                         timestamps,
                         ma_values,
                         label=f"{column} MA ({ma_window})",
+                        color=plot_color,
                         linestyle="--",
                         linewidth=1.25,
                         alpha=0.85,
@@ -226,6 +237,51 @@ def plot_devices(
             ax.set_ylabel("Sensor value")
             ax.grid(True)
             ax.legend(loc="upper right")
+
+    if has_angd:
+        if len(rows_by_device) < 2:
+            raise ValueError("angd requires at least two sensors (sensor1 and sensor2)")
+
+        (device1, rows1), (device2, rows2) = list(rows_by_device.items())[:2]
+        timestamps1, data1 = collect_group_data(rows1, ["angd"], {"angd": COLUMNS["angd"]})
+        timestamps2, data2 = collect_group_data(rows2, ["angd"], {"angd": COLUMNS["angd"]})
+
+        angle_cols = COLUMNS["angd"]
+        min_len = min(len(timestamps1), len(timestamps2))
+        if min_len == 0:
+            raise ValueError("angd requires angle samples in both sensors")
+
+        ax = axes_list[-1]
+        for column in angle_cols:
+            values1 = data1["angd"][column][:min_len]
+            values2 = data2["angd"][column][:min_len]
+            diff_values = [v1 - v2 for v1, v2 in zip(values1, values2)]
+
+            plot_color = ANGLE_COLORS.get(column)
+
+            if column.startswith("Angle"):
+                label = f"Δ{column.split('(')[0].strip()}"
+            else:
+                label = f"Δ{column}"
+            ax.plot(timestamps1[:min_len], diff_values, label=label, color=plot_color)
+            if ma_window >= 2 and diff_values:
+                ma_values = compute_moving_average(diff_values, ma_window)
+                ax.plot(
+                    timestamps1[:min_len],
+                    ma_values,
+                    label=f"{label} MA ({ma_window})",
+                    color=plot_color,
+                    linestyle="--",
+                    linewidth=1.25,
+                    alpha=0.85,
+                )
+
+        alias1 = alias_map[device1]
+        alias2 = alias_map[device2]
+        ax.set_title(f"{alias1} - {alias2} — ANGD")
+        ax.set_ylabel("Δ angle")
+        ax.grid(True)
+        ax.legend(loc="upper right")
 
     axes_list[-1].set_xlabel("time")
     axes_list[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
