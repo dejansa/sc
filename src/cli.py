@@ -46,9 +46,10 @@ def is_header_row(row: Dict[str, str]) -> bool:
 
 
 COLUMNS = {
+    "ang": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),
+    "angc": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # correct angZ for wrap-around
     "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),
-    "ang": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)")
 }
 
@@ -138,7 +139,10 @@ def collect_group_data(
                         f"CSV is missing the {column!r} column required for plotting"
                     )
                 try:
-                    column_data[group][column].append(float(value))
+                    numeric_value = float(value)
+                    if group == "angc" and column == "AngleZ(°)" and numeric_value <= 0.1:
+                        numeric_value += 360
+                    column_data[group][column].append(numeric_value)
                 except ValueError as exc:
                     raise ValueError(
                         f"Non-numeric entry {value!r} in column {column} at row {idx}"
@@ -261,7 +265,7 @@ def parse_args() -> argparse.Namespace:
         "-g",
         "--group",
         default="acc",
-        help="Comma-separated column groups to visualize (valid: acc, as, ang, h; default: %(default)s)",
+        help=f"Comma-separated column groups to visualize (valid: {','.join(COLUMNS.keys())}; default: %(default)s)",
     )
     parser.add_argument(
         "-v",
