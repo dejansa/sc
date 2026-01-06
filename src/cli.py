@@ -47,7 +47,6 @@ def is_header_row(row: Dict[str, str]) -> bool:
 
 COLUMNS = {
     "ang": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),
-    "angc": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # correct angZ for wrap-around
     "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
     "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),
@@ -71,6 +70,24 @@ def parse_timestamp(value: str, row_index: int) -> datetime:
     raise ValueError(
         f"Cannot parse timestamp {value!r} at row {row_index}: expected formats {TIME_FORMATS}"
     ) from last_error
+
+
+def unwrap_degrees(values: List[float]) -> List[float]:
+    if not values:
+        return []
+
+    unwrapped = [values[0]]
+    prev_adjusted = values[0]
+    for value in values[1:]:
+        adjusted = value
+        delta = adjusted - prev_adjusted
+        if delta > 180:
+            adjusted -= 360
+        elif delta < -180:
+            adjusted += 360
+        unwrapped.append(unwrapped[-1] + (adjusted - prev_adjusted))
+        prev_adjusted = adjusted
+    return unwrapped
 
 
 def parse_csv_file(csv_path: Path | str) -> Dict[str, List[Dict[str, str]]]:
@@ -147,13 +164,16 @@ def collect_group_data(
                     )
                 try:
                     numeric_value = float(value)
-                    if group in {"angc", "angd"} and column == "AngleZ(°)" and numeric_value <= 0.1:
-                        numeric_value += 360
                     column_data[group][column].append(numeric_value)
                 except ValueError as exc:
                     raise ValueError(
                         f"Non-numeric entry {value!r} in column {column} at row {idx}"
                     ) from exc
+
+    for group, columns in columns_map.items():
+        for column in columns:
+            if column.startswith("Angle"):
+                column_data[group][column] = unwrap_degrees(column_data[group][column])
     return timestamps, column_data
 
 
@@ -219,7 +239,7 @@ def plot_devices(
             ax = axes_list[axis_idx]
             for column in columns_map[group]:
                 column_values = column_data[group][column]
-                plot_color = ANGLE_COLORS.get(column) if group in {"ang", "angc"} else None
+                plot_color = ANGLE_COLORS.get(column) if group == "ang" else None
                 ax.plot(timestamps, column_values, label=column, color=plot_color)
                 if ma_window >= 2 and column_values:
                     ma_values = compute_moving_average(column_values, ma_window)
