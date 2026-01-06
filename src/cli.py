@@ -1,5 +1,6 @@
 import argparse
 import csv
+import math
 import tomllib
 from collections import defaultdict
 from importlib.metadata import PackageNotFoundError, version
@@ -50,7 +51,8 @@ COLUMNS = {
     "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
     "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),
-    "h": ("HX(uT)", "HY(uT)", "HZ(uT)")
+    "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),
+    "hn": ("HNorm(uT)",),
 }
 
 ANGLE_COLORS = {
@@ -156,6 +158,26 @@ def collect_group_data(
         timestamps.append(parse_timestamp(time_value, idx))
 
         for group, columns in columns_map.items():
+            if group == "hn":
+                hx = row.get("HX(uT)")
+                hy = row.get("HY(uT)")
+                hz = row.get("HZ(uT)")
+                if hx is None or hy is None or hz is None:
+                    raise KeyError(
+                        "CSV is missing one of the required magnetometer columns: 'HX(uT)', 'HY(uT)', 'HZ(uT)'"
+                    )
+                try:
+                    bx = float(hx)
+                    by = float(hy)
+                    bz = float(hz)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Non-numeric entry in magnetometer columns at row {idx}"
+                    ) from exc
+
+                bmag = math.sqrt(bx * bx + by * by + bz * bz)
+                column_data[group]["HNorm(uT)"].append(bmag)
+                continue
             for column in columns:
                 value = row.get(column)
                 if value is None:
