@@ -50,9 +50,12 @@ COLUMNS = {
     "ang": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),
     "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
     "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),
+    "accn": ("AccNorm(g)",),
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),
+    "asn": ("AsNorm(°/s)",),
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),
     "hn": ("HNorm(uT)",),
+    "tilt": ("Pitch(°)", "Roll(°)"),
 }
 
 ANGLE_COLORS = {
@@ -177,6 +180,67 @@ def collect_group_data(
 
                 bmag = math.sqrt(bx * bx + by * by + bz * bz)
                 column_data[group]["HNorm(uT)"].append(bmag)
+                continue
+            if group == "accn":
+                ax_val = row.get("AccX(g)")
+                ay_val = row.get("AccY(g)")
+                az_val = row.get("AccZ(g)")
+                if ax_val is None or ay_val is None or az_val is None:
+                    raise KeyError(
+                        "CSV is missing one of the required accelerometer columns: 'AccX(g)', 'AccY(g)', 'AccZ(g)'"
+                    )
+                try:
+                    ax = float(ax_val)
+                    ay = float(ay_val)
+                    az = float(az_val)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Non-numeric entry in accelerometer columns at row {idx}"
+                    ) from exc
+                amag = math.sqrt(ax * ax + ay * ay + az * az)
+                column_data[group]["AccNorm(g)"].append(amag)
+                continue
+            if group == "asn":
+                gx_val = row.get("AsX(°/s)")
+                gy_val = row.get("AsY(°/s)")
+                gz_val = row.get("AsZ(°/s)")
+                if gx_val is None or gy_val is None or gz_val is None:
+                    raise KeyError(
+                        "CSV is missing one of the required gyroscope columns: 'AsX(°/s)', 'AsY(°/s)', 'AsZ(°/s)'"
+                    )
+                try:
+                    gx = float(gx_val)
+                    gy = float(gy_val)
+                    gz = float(gz_val)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Non-numeric entry in gyroscope columns at row {idx}"
+                    ) from exc
+                gmag = math.sqrt(gx * gx + gy * gy + gz * gz)
+                column_data[group]["AsNorm(°/s)"].append(gmag)
+                continue
+            if group == "tilt":
+                ax_val = row.get("AccX(g)")
+                ay_val = row.get("AccY(g)")
+                az_val = row.get("AccZ(g)")
+                if ax_val is None or ay_val is None or az_val is None:
+                    raise KeyError(
+                        "CSV is missing one of the required accelerometer columns: 'AccX(g)', 'AccY(g)', 'AccZ(g)'"
+                    )
+                try:
+                    ax = float(ax_val)
+                    ay = float(ay_val)
+                    az = float(az_val)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Non-numeric entry in accelerometer columns at row {idx}"
+                    ) from exc
+
+                # Standard pitch/roll from accelerometer (gravity vector).
+                roll = math.degrees(math.atan2(ay, az))
+                pitch = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+                column_data[group]["Pitch(°)"].append(pitch)
+                column_data[group]["Roll(°)"].append(roll)
                 continue
             for column in columns:
                 value = row.get(column)
