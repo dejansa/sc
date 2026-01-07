@@ -351,8 +351,8 @@ def plot_devices(
                         alpha=0.85,
                     )
             alias = alias_map[device]
-            ax.set_title(f"{alias} — {group.upper()}")
-            ax.set_ylabel("Sensor value")
+            ax.set_title(group.upper())
+            ax.set_ylabel(alias)
             ax.grid(True)
             ax.legend(loc="upper right")
 
@@ -394,9 +394,7 @@ def plot_devices(
                     alpha=0.85,
                 )
 
-        alias1 = alias_map[device1]
-        alias2 = alias_map[device2]
-        ax.set_title(f"{alias1} - {alias2} — ANGD")
+        ax.set_title("ANGD")
         ax.set_ylabel("Δ angle")
         ax.grid(True)
         ax.legend(loc="upper right")
