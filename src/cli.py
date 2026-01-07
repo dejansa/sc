@@ -1,15 +1,19 @@
 import argparse
 import csv
 import math
-import tomllib
 from collections import defaultdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
 from datetime import datetime
+
+try:
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # allow `--help` without optional runtime deps
+    mdates = None  # type: ignore[assignment]
+    plt = None  # type: ignore[assignment]
 
 CSV_FILE_PATH = "/mnt/c/Users/DSavkovic/Downloads/SC/20260103105034.csv"
 
@@ -27,6 +31,10 @@ PACKAGE_NAME = "sc"
 
 
 def _version_from_pyproject() -> Optional[str]:
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return None
     try:
         pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
         with pyproject_path.open("rb") as fp:
@@ -47,15 +55,15 @@ def is_header_row(row: Dict[str, str]) -> bool:
 
 
 COLUMNS = {
-    "ang": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),
+    "ang": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # orientation angles
+    "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),  # accelerometer
+    "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),  # gyroscope (angular speed)
+    "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),  # magnetometer (magnetic field)
     "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
-    "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),
-    "accn": ("AccNorm(g)",),
-    "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),
-    "asn": ("AsNorm(°/s)",),
-    "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),
-    "hn": ("HNorm(uT)",),
-    "tilt": ("Pitch(°)", "Roll(°)"),
+    "accn": ("AccNorm(g)",),  # normalized acceleration magnitude
+    "asn": ("AsNorm(°/s)",), # normalized angular speed magnitude
+    "hn": ("HNorm(uT)",),  # normalized magnetic field magnitude
+    "tilt": ("Pitch(°)", "Roll(°)"),  # pitch and roll from accelerometer
 }
 
 ANGLE_COLORS = {
@@ -288,6 +296,10 @@ def plot_devices(
     block: bool = True,
     ma_window: int = 5,
 ) -> None:
+    if plt is None or mdates is None:
+        raise RuntimeError(
+            "matplotlib is required for plotting. Install dependencies (e.g. `pip install matplotlib`)."
+        )
     if not column_groups:
         raise ValueError("At least one column group must be specified for plotting")
 
@@ -418,7 +430,10 @@ def parse_group_list(value: str) -> List[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot SC sensor export (TSV/CSV) traces by column group")
+    parser = argparse.ArgumentParser(
+        description="Plot SC sensor export (TSV/CSV) traces by column group",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument(
         "file",
         help="Path to the CSV or TSV file to parse",
@@ -427,7 +442,19 @@ def parse_args() -> argparse.Namespace:
         "-g",
         "--group",
         default="acc",
-        help=f"Comma-separated column groups to visualize (valid: {','.join(COLUMNS.keys())}; default: %(default)s)",
+        help=(
+            "Comma-separated column groups to visualize\n"
+            f"(valid: {', '.join(COLUMNS.keys())}; default: %(default)s)\n"
+            "ang  - angles\n"
+            "acc  - accelerations\n"
+            "as   - angular speed (gyroscope)\n"
+            "h    - magnetic field (magnetometer)\n"
+            "angd - sensor1 - sensor2 angle delta\n"
+            "accn - acceleration magnitude (norm)\n"
+            "asn  - angular speed magnitude (norm)\n"
+            "hn   - magnetic field magnitude (norm)\n"
+            "tilt - pitch/roll from accelerometer"
+        ),
     )
     parser.add_argument(
         "-v",
@@ -450,6 +477,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if plt is None:
+        raise RuntimeError(
+            "matplotlib is required for plotting. Install dependencies (e.g. `pip install matplotlib`)."
+        )
     rows_by_device = parse_tsv_file(args.file)
     # total_rows = sum(len(rows) for rows in rows_by_device.values())
     # print(f"Parsed {total_rows} rows from {args.file}")

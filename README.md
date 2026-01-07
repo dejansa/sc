@@ -30,17 +30,28 @@ $ pipx upgrade-all
 
 ```bash
 ❯ scx --help
-usage: scx [-h] [-g GROUP] [-ma MA_WINDOW] [file]
+usage: scx [-h] [-g GROUP] [-v] [-ma MA_WINDOW] file
 
 Plot SC sensor export (TSV/CSV) traces by column group
 
 positional arguments:
-  file                  Path to the CSV file to parse
+  file                  Path to the CSV or TSV file to parse
 
 options:
   -h, --help            show this help message and exit
   -g GROUP, --group GROUP
-                        Comma-separated column groups to visualize (valid: acc, as, ang, h; default: acc)
+                        Comma-separated column groups to visualize
+                        (valid: ang, acc, as, h, angd, accn, asn, hn, tilt; default: acc)
+                        ang  - angles
+                        acc  - accelerations
+                        as   - angular speed (gyroscope)
+                        h    - magnetic field (magnetometer)
+                        angd - sensor1 - sensor2 angle delta
+                        accn - acceleration magnitude (norm)
+                        asn  - angular speed magnitude (norm)
+                        hn   - magnetic field magnitude (norm)
+                        tilt - pitch/roll from accelerometer
+  -v, --version         Show the installed package version
   -ma MA_WINDOW, --ma-window MA_WINDOW
                         Simple moving average window size per signal (default: 5)
 ```
