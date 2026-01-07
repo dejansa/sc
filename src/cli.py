@@ -63,7 +63,7 @@ COLUMNS = {
     "accn": ("AccNorm(g)",),  # normalized acceleration magnitude
     "asn": ("AsNorm(°/s)",), # normalized angular speed magnitude
     "hn": ("HNorm(uT)",),  # normalized magnetic field magnitude
-    "tilt": ("Pitch(°)", "Roll(°)"),  # pitch and roll from accelerometer
+    "tilt": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # pitch/roll from accelerometer + yaw from magnetometer
 }
 
 ANGLE_COLORS = {
@@ -249,6 +249,34 @@ def collect_group_data(
                 pitch = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
                 column_data[group]["Pitch(°)"].append(pitch)
                 column_data[group]["Roll(°)"].append(roll)
+
+                # Yaw/heading: tilt-compensated magnetometer heading.
+                hx_val = row.get("HX(uT)")
+                hy_val = row.get("HY(uT)")
+                hz_val = row.get("HZ(uT)")
+                if hx_val is None or hy_val is None or hz_val is None:
+                    raise KeyError(
+                        "CSV is missing one of the required magnetometer columns for yaw: 'HX(uT)', 'HY(uT)', 'HZ(uT)'"
+                    )
+                try:
+                    hx = float(hx_val)
+                    hy = float(hy_val)
+                    hz = float(hz_val)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Non-numeric entry in magnetometer columns at row {idx}"
+                    ) from exc
+
+                roll_rad = math.radians(roll)
+                pitch_rad = math.radians(pitch)
+                mx2 = hx * math.cos(pitch_rad) + hz * math.sin(pitch_rad)
+                my2 = (
+                    hx * math.sin(roll_rad) * math.sin(pitch_rad)
+                    + hy * math.cos(roll_rad)
+                    - hz * math.sin(roll_rad) * math.cos(pitch_rad)
+                )
+                yaw = math.degrees(math.atan2(my2, mx2))
+                column_data[group]["Yaw(°)"].append(yaw)
                 continue
             for column in columns:
                 value = row.get(column)
@@ -266,7 +294,7 @@ def collect_group_data(
 
     for group, columns in columns_map.items():
         for column in columns:
-            if column.startswith("Angle"):
+            if column.startswith("Angle") or column == "Yaw(°)":
                 column_data[group][column] = unwrap_degrees(column_data[group][column])
     return timestamps, column_data
 
@@ -451,7 +479,7 @@ def parse_args() -> argparse.Namespace:
             "accn - acceleration magnitude (norm)\n"
             "asn  - angular speed magnitude (norm)\n"
             "hn   - magnetic field magnitude (norm)\n"
-            "tilt - pitch/roll from accelerometer"
+            "tilt - pitch/roll from accelerometer + yaw heading"
         ),
     )
     parser.add_argument(

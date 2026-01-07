@@ -50,7 +50,7 @@ options:
                         accn - acceleration magnitude (norm)
                         asn  - angular speed magnitude (norm)
                         hn   - magnetic field magnitude (norm)
-                        tilt - pitch/roll from accelerometer
+                        tilt - pitch/roll from accelerometer + yaw heading
   -v, --version         Show the installed package version
   -ma MA_WINDOW, --ma-window MA_WINDOW
                         Simple moving average window size per signal (default: 5)
