@@ -46,7 +46,7 @@ options:
                         acc  - accelerations
                         as   - angular speed (gyroscope)
                         h    - magnetic field (magnetometer)
-                        angd - sensor1 - sensor2 angle delta
+                        angd - LEFT-RIGHT angle delta
                         accn - acceleration magnitude (norm)
                         asn  - angular speed magnitude (norm)
                         hn   - magnetic field magnitude (norm)

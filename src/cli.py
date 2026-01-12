@@ -556,7 +556,7 @@ def plot_devices(
 
     if has_angd:
         if len(rows_by_device) < 2:
-            raise ValueError("angd requires at least two sensors (sensor1 and sensor2)")
+            raise ValueError("angd requires at least two sensors (LEFT-RIGHT)")
 
         (device1, rows1), (device2, rows2) = list(rows_by_device.items())[:2]
         timestamps1, data1 = collect_group_data(rows1, ["angd"], {"angd": COLUMNS["angd"]})
@@ -645,7 +645,7 @@ def parse_args() -> argparse.Namespace:
             "acc  - accelerations\n"
             "as   - angular speed (gyroscope)\n"
             "h    - magnetic field (magnetometer)\n"
-            "angd - sensor1 - sensor2 angle delta\n"
+            "angd - LEFT-RIGHT angle delta\n"
             "accn - acceleration magnitude (norm)\n"
             "asn  - angular speed magnitude (norm)\n"
             "hn   - magnetic field magnitude (norm)\n"
