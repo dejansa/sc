@@ -17,6 +17,10 @@ except ModuleNotFoundError:  # allow `--help` without optional runtime deps
 
 CSV_FILE_PATH = "/mnt/c/Users/DSavkovic/Downloads/SC/20260103105034.csv"
 
+SENSORS = {
+    "LEFT": "DF:25:4D:3D:35:6A",
+    "RIGHT": "CC:4F:71:B6:CE:8F"
+}
 
 # `time` is the axis we use for all plots. Support multiple formats so microseconds remain optional.
 TIME_COLUMN = "time"
@@ -459,6 +463,26 @@ def compute_moving_average(values: List[float], window: int) -> List[float]:
     return averages
 
 
+def device_to_sensor_label(device_name: str, *, fallback: str) -> str:
+    """Map a DeviceName to a human label (e.g. LEFT/RIGHT).
+
+    The `SENSORS` dict maps display labels (keys) to an identifier substring
+    (values) that is expected to appear in the DeviceName column.
+
+    Parameters:
+        device_name: Raw DeviceName value from the file.
+        fallback: Label to use when no `SENSORS` entry matches.
+
+    Returns:
+        A display label such as "LEFT" or "RIGHT".
+    """
+
+    for label, identifier in SENSORS.items():
+        if identifier and identifier in device_name:
+            return label
+    return fallback
+
+
 def plot_devices(
     rows_by_device: Dict[str, List[Dict[str, str]]],
     column_groups: List[str],
@@ -500,7 +524,10 @@ def plot_devices(
     )
     axes_list = [axis[0] for axis in axes]
 
-    alias_map = {device: f"sensor{idx + 1}" for idx, device in enumerate(rows_by_device)}
+    alias_map = {
+        device: device_to_sensor_label(device, fallback=f"sensor{idx + 1}")
+        for idx, device in enumerate(rows_by_device)
+    }
     for device_idx, (device, rows) in enumerate(rows_by_device.items()):
         timestamps, column_data = collect_group_data(rows, base_groups, columns_map)
         for group_idx, group in enumerate(base_groups):
@@ -574,12 +601,12 @@ def plot_devices(
     axes_list[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
 
     subplot_params = dict(
-        left=0.03,
-        bottom=0.1,
-        right=0.97,
-        top=0.97,
-        wspace=0.2,
-        hspace=0.2,
+        left=0.04,
+        bottom=0.08,
+        right=0.99,
+        top=0.96,
+        wspace=0.3,
+        hspace=0.3,
     )
     fig.subplots_adjust(**subplot_params)
     fig.autofmt_xdate(bottom=subplot_params["bottom"])
