@@ -53,9 +53,9 @@ options:
                         asn  - angular speed magnitude (norm)
                         hn   - magnetic field magnitude (norm)
                         tilt - pitch/roll from accelerometer + yaw heading
-                        mad  - Madgwick filter (MARG if magnetometer present)
-                        mah  - Mahony filter (MARG if magnetometer present)
-                        ekf  - Extended Kalman Filter (MARG if magnetometer present)
+                        mad  - Madgwick filter
+                        mah  - Mahony filter
+                        ekf  - Extended Kalman Filter
   -v, --version         Show the installed package version
   -ma MA_WINDOW, --ma-window MA_WINDOW
                         Simple moving average window size per signal (default: 5)

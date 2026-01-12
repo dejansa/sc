@@ -68,9 +68,9 @@ COLUMNS = {
     "asn": ("AsNorm(°/s)",), # normalized angular speed magnitude
     "hn": ("HNorm(uT)",),  # normalized magnetic field magnitude
     "tilt": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # pitch/roll from accelerometer + yaw from magnetometer
-    "mad": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Madgwick filter (MARG if mag present)
-    "mah": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Mahony filter (MARG if mag present)
-    "ekf": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Extended Kalman Filter (MARG if mag present)
+    "mad": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Madgwick filter
+    "mah": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Mahony filter
+    "ekf": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Extended Kalman Filter
 }
 
 ANGLE_COLORS = {
@@ -650,9 +650,9 @@ def parse_args() -> argparse.Namespace:
             "asn  - angular speed magnitude (norm)\n"
             "hn   - magnetic field magnitude (norm)\n"
             "tilt - pitch/roll from accelerometer + yaw heading\n"
-            "mad  - Madgwick filter (MARG if magnetometer present)\n"
-            "mah  - Mahony filter (MARG if magnetometer present)\n"
-            "ekf  - Extended Kalman Filter (MARG if magnetometer present)"
+            "mad  - Madgwick filter\n"
+            "mah  - Mahony filter\n"
+            "ekf  - Extended Kalman Filter"
         ),
     )
     parser.add_argument(
