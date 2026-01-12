@@ -64,6 +64,9 @@ COLUMNS = {
     "asn": ("AsNorm(°/s)",), # normalized angular speed magnitude
     "hn": ("HNorm(uT)",),  # normalized magnetic field magnitude
     "tilt": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # pitch/roll from accelerometer + yaw from magnetometer
+    "mad": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Madgwick filter (MARG if mag present)
+    "mah": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Mahony filter (MARG if mag present)
+    "ekf": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Extended Kalman Filter (MARG if mag present)
 }
 
 ANGLE_COLORS = {
@@ -160,15 +163,155 @@ def collect_group_data(
         for group, columns in columns_map.items()
     }
     timestamps: List[datetime] = []
+
+    # Lazy init of AHRS filters so `--help` still works without optional deps.
+    needs_ahrs = any(group in {"mad", "mah", "ekf"} for group in columns_map)
+    if needs_ahrs:
+        try:
+            import numpy as np
+            from ahrs.common.orientation import q2euler
+            from ahrs.filters import EKF, Madgwick, Mahony
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Missing optional dependency for 'mad'/'mah'/'ekf' groups. "
+                "Install with `pip install ahrs`."
+            ) from exc
+
+        ahrs_filters: Dict[str, object] = {
+            "mad": Madgwick(),
+            "mah": Mahony(),
+            "ekf": EKF(),
+        }
+        ahrs_q: Dict[str, "np.ndarray"] = {
+            "mad": np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
+            "mah": np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
+            "ekf": np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
+        }
+        last_euler_deg: Dict[str, tuple[float, float, float]] = {
+            "mad": (0.0, 0.0, 0.0),
+            "mah": (0.0, 0.0, 0.0),
+            "ekf": (0.0, 0.0, 0.0),
+        }
+        last_dt: float = 0.01
+        prev_ts: datetime | None = None
     for idx, row in enumerate(rows, start=1):
         time_value = row.get(TIME_COLUMN)
         if time_value is None:
             raise KeyError(
                 f"CSV is missing the {TIME_COLUMN!r} column required for the X axis"
             )
-        timestamps.append(parse_timestamp(time_value, idx))
+        ts = parse_timestamp(time_value, idx)
+        timestamps.append(ts)
+
+        if needs_ahrs:
+            if prev_ts is not None:
+                dt_candidate = (ts - prev_ts).total_seconds()
+                if dt_candidate > 0.0:
+                    last_dt = dt_candidate
+            prev_ts = ts
 
         for group, columns in columns_map.items():
+            if group in {"mad", "mah", "ekf"}:
+                ax_val = row.get("AccX(g)")
+                ay_val = row.get("AccY(g)")
+                az_val = row.get("AccZ(g)")
+                gx_val = row.get("AsX(°/s)")
+                gy_val = row.get("AsY(°/s)")
+                gz_val = row.get("AsZ(°/s)")
+                if (
+                    ax_val is None
+                    or ay_val is None
+                    or az_val is None
+                    or gx_val is None
+                    or gy_val is None
+                    or gz_val is None
+                ):
+                    raise KeyError(
+                        "CSV is missing one of the required IMU columns for 'mad'/'mah'/'ekf': "
+                        "'AccX(g)', 'AccY(g)', 'AccZ(g)', 'AsX(°/s)', 'AsY(°/s)', 'AsZ(°/s)'"
+                    )
+                try:
+                    ax = float(ax_val)
+                    ay = float(ay_val)
+                    az = float(az_val)
+                    gx = float(gx_val)
+                    gy = float(gy_val)
+                    gz = float(gz_val)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Non-numeric entry in IMU columns at row {idx}"
+                    ) from exc
+
+                hx_val = row.get("HX(uT)")
+                hy_val = row.get("HY(uT)")
+                hz_val = row.get("HZ(uT)")
+
+                mag_present = hx_val is not None and hy_val is not None and hz_val is not None
+                if mag_present:
+                    try:
+                        hx = float(hx_val)
+                        hy = float(hy_val)
+                        hz = float(hz_val)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Non-numeric entry in magnetometer columns at row {idx}"
+                        ) from exc
+
+                gyr = np.array(
+                    [
+                        math.radians(gx),
+                        math.radians(gy),
+                        math.radians(gz),
+                    ],
+                    dtype=float,
+                )
+                acc = np.array([ax, ay, az], dtype=float)
+                q = ahrs_q[group]
+                filt = ahrs_filters[group]
+
+                # Some logs have duplicate timestamps. Reuse the last observed dt.
+                dt = last_dt if last_dt > 0.0 else 0.01
+
+                # Guard against invalid acceleration samples.
+                if float(np.linalg.norm(acc)) == 0.0:
+                    pitch_deg, roll_deg, yaw_deg = last_euler_deg[group]
+                    column_data[group]["Pitch(°)"].append(pitch_deg)
+                    column_data[group]["Roll(°)"].append(roll_deg)
+                    column_data[group]["Yaw(°)"].append(yaw_deg)
+                    continue
+
+                try:
+                    if group == "ekf":
+                        if mag_present:
+                            mag = np.array([hx, hy, hz], dtype=float)
+                            q = filt.update(q=q, gyr=gyr, acc=acc, mag=mag, dt=dt)
+                        else:
+                            q = filt.update(q=q, gyr=gyr, acc=acc, dt=dt)
+                    else:
+                        if mag_present:
+                            mag = np.array([hx, hy, hz], dtype=float)
+                            q = filt.updateMARG(q=q, gyr=gyr, acc=acc, mag=mag, dt=dt)
+                        else:
+                            q = filt.updateIMU(q=q, gyr=gyr, acc=acc, dt=dt)
+                except Exception:
+                    # If the filter update fails for a sample, keep the last output.
+                    pitch_deg, roll_deg, yaw_deg = last_euler_deg[group]
+                    column_data[group]["Pitch(°)"].append(pitch_deg)
+                    column_data[group]["Roll(°)"].append(roll_deg)
+                    column_data[group]["Yaw(°)"].append(yaw_deg)
+                    continue
+
+                ahrs_q[group] = q
+                roll_rad, pitch_rad, yaw_rad = q2euler(q)
+                roll_deg = math.degrees(float(roll_rad))
+                pitch_deg = math.degrees(float(pitch_rad))
+                yaw_deg = math.degrees(float(yaw_rad))
+                last_euler_deg[group] = (pitch_deg, roll_deg, yaw_deg)
+
+                column_data[group]["Pitch(°)"].append(pitch_deg)
+                column_data[group]["Roll(°)"].append(roll_deg)
+                column_data[group]["Yaw(°)"].append(yaw_deg)
+                continue
             if group == "hn":
                 hx = row.get("HX(uT)")
                 hy = row.get("HY(uT)")
@@ -479,7 +622,10 @@ def parse_args() -> argparse.Namespace:
             "accn - acceleration magnitude (norm)\n"
             "asn  - angular speed magnitude (norm)\n"
             "hn   - magnetic field magnitude (norm)\n"
-            "tilt - pitch/roll from accelerometer + yaw heading"
+            "tilt - pitch/roll from accelerometer + yaw heading\n"
+            "mad  - Madgwick filter (MARG if magnetometer present)\n"
+            "mah  - Mahony filter (MARG if magnetometer present)\n"
+            "ekf  - Extended Kalman Filter (MARG if magnetometer present)"
         ),
     )
     parser.add_argument(

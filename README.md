@@ -41,7 +41,7 @@ options:
   -h, --help            show this help message and exit
   -g GROUP, --group GROUP
                         Comma-separated column groups to visualize
-                        (valid: ang, acc, as, h, angd, accn, asn, hn, tilt; default: acc)
+                        (valid: ang, acc, as, h, angd, accn, asn, hn, tilt, mad, mah, ekf; default: acc)
                         ang  - angles
                         acc  - accelerations
                         as   - angular speed (gyroscope)
@@ -51,6 +51,9 @@ options:
                         asn  - angular speed magnitude (norm)
                         hn   - magnetic field magnitude (norm)
                         tilt - pitch/roll from accelerometer + yaw heading
+                        mad  - Madgwick filter (MARG if magnetometer present)
+                        mah  - Mahony filter (MARG if magnetometer present)
+                        ekf  - Extended Kalman Filter (MARG if magnetometer present)
   -v, --version         Show the installed package version
   -ma MA_WINDOW, --ma-window MA_WINDOW
                         Simple moving average window size per signal (default: 5)

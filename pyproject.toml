@@ -1,10 +1,11 @@
 [project]
 name = "sc"
-version = "0.1.10"
+version = "0.1.11"
 description = "Sensor chart viewing utility"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ahrs>=0.4.0",
     "matplotlib>=3.7",
 ]
 
