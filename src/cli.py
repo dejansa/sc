@@ -463,6 +463,143 @@ def compute_moving_average(values: List[float], window: int) -> List[float]:
     return averages
 
 
+def _estimate_sample_interval(timestamps: List[datetime]) -> float:
+    """Return the average positive spacing between consecutive timestamps."""
+
+    if len(timestamps) < 2:
+        raise ValueError("Need at least two timestamps to estimate the sampling interval")
+
+    intervals: List[float] = []
+    for prev, curr in zip(timestamps, timestamps[1:]):
+        delta = (curr - prev).total_seconds()
+        if delta > 0.0:
+            intervals.append(delta)
+    if not intervals:
+        raise ValueError("Timestamps must be strictly increasing to estimate sampling interval")
+    return sum(intervals) / len(intervals)
+
+
+def _calculate_frequency_spectrum(values: List[float], sample_interval: float) -> tuple[List[float], List[float]]:
+    """Return frequency bins and magnitude from the real FFT of `values`."""
+
+    if sample_interval <= 0:
+        raise ValueError("Sample interval must be positive for FFT calculations")
+    try:
+        import numpy as np
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "numpy is required to compute FFT plots. Install it with `pip install numpy`."
+        ) from exc
+
+    samples = np.asarray(values, dtype=float)
+    if samples.size < 2:
+        raise ValueError("At least two samples are required to compute FFT")
+
+    centered = samples - float(np.mean(samples))
+    fft_values = np.fft.rfft(centered)
+    frequencies = np.fft.rfftfreq(samples.size, d=sample_interval)
+    magnitudes = np.abs(fft_values)
+    return frequencies.tolist(), magnitudes.tolist()
+
+
+def plot_frequency_spectrum(
+    rows_by_device: Dict[str, List[Dict[str, str]]],
+    group: str,
+    *,
+    block: bool = True,
+) -> None:
+    """Render a frequency-domain view for the first requested column group."""
+
+    if plt is None:
+        raise RuntimeError(
+            "matplotlib is required for FFT plotting. Install dependencies (e.g. `pip install matplotlib`)."
+        )
+    if group not in COLUMNS:
+        raise KeyError(
+            f"Unknown column group {group!r}; valid keys: {', '.join(COLUMNS)}"
+        )
+    if not rows_by_device:
+        raise ValueError("No device data available for FFT plotting")
+
+    columns = COLUMNS[group]
+    columns_map = {group: columns}
+    n_devices = len(rows_by_device)
+    fig, axes = plt.subplots(
+        n_devices,
+        1,
+        sharex=True,
+        figsize=(12, 2 + n_devices * 1.5),
+        squeeze=False,
+    )
+    axes_list = [axis[0] for axis in axes]
+
+    alias_map = {
+        device: device_to_sensor_label(device, fallback=f"sensor{idx + 1}")
+        for idx, device in enumerate(rows_by_device)
+    }
+
+    for device_idx, (device, rows) in enumerate(rows_by_device.items()):
+        ax = axes_list[device_idx]
+        timestamps, column_data = collect_group_data(rows, [group], columns_map)
+        alias = alias_map[device]
+        try:
+            sample_interval = _estimate_sample_interval(timestamps)
+        except ValueError as exc:
+            ax.text(
+                0.5,
+                0.5,
+                "Insufficient samples for FFT",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_title(f"{alias} FFT")
+            ax.set_ylabel(alias)
+            ax.grid(True)
+            continue
+
+        plotted = False
+        for column in columns:
+            values = column_data[group][column]
+            if len(values) < 2:
+                continue
+            try:
+                frequencies, magnitudes = _calculate_frequency_spectrum(
+                    values, sample_interval
+                )
+            except ValueError:
+                continue
+            ax.plot(frequencies, magnitudes, label=column)
+            plotted = True
+
+        ax.set_title(f"{alias} FFT")
+        ax.set_ylabel(alias)
+        ax.grid(True)
+        if plotted:
+            ax.legend(loc="upper right")
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No valid signal samples",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+
+    axes_list[-1].set_xlabel("frequency (Hz)")
+    subplot_params = dict(
+        left=0.06,
+        bottom=0.08,
+        right=0.98,
+        top=0.94,
+        wspace=0.2,
+        hspace=0.4,
+    )
+    fig.subplots_adjust(**subplot_params)
+    plt.show(block=block)
+
+
 def device_to_sensor_label(device_name: str, *, fallback: str) -> str:
     """Map a DeviceName to a human label (e.g. LEFT/RIGHT).
 
@@ -669,6 +806,14 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Simple moving average window size per signal (default: %(default)s)",
     )
+    parser.add_argument(
+        "-f",
+        "--fft",
+        action="store_true",
+        help=(
+            "Plot the FFT of the first group listed in --group"
+        ),
+    )
     args = parser.parse_args()
     args.groups = parse_group_list(args.group)
     return args
@@ -691,6 +836,12 @@ def main() -> None:
             block=False,
             ma_window=args.ma_window,
         )
+        if args.fft:
+            plot_frequency_spectrum(
+                rows_by_device,
+                args.groups[0],
+                block=False,
+            )
         plt.show()
 
 
