@@ -1,12 +1,13 @@
 import argparse
 import csv
 import math
+import re
 from collections import defaultdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 try:
     import matplotlib.dates as mdates
@@ -120,6 +121,129 @@ def parse_tsv_file(tsv_path: Path | str) -> Dict[str, List[Dict[str, str]]]:
     """Return rows grouped by DeviceName so callers can access data per device, sorted by time."""
 
     return _parse_tabular_file(tsv_path, delimiter="\t")
+
+
+def parse_ride_pair(ride_path: Path | str) -> Dict[str, List[Dict[str, str]]]:
+    """Parse a .ride file and its LEFT/RIGHT counterpart.
+
+    The .ride export format is a CSV-like file that does not include a `DeviceName`
+    column. Instead, the device side is encoded in the filename (e.g.
+    `*_left.ride` / `*_right.ride`). When the user provides one side, this loader
+    automatically locates and loads the other side from the same directory.
+
+    Returns:
+        A mapping of device label ("LEFT"/"RIGHT") to a list of normalized rows.
+    """
+
+    input_path = Path(ride_path).expanduser()
+    left_path, right_path = _resolve_ride_pair_paths(input_path)
+    return {
+        "LEFT": parse_ride_file(left_path, device_label="LEFT"),
+        "RIGHT": parse_ride_file(right_path, device_label="RIGHT"),
+    }
+
+
+def _resolve_ride_pair_paths(path: Path) -> tuple[Path, Path]:
+    """Return (left_path, right_path) for a .ride input path."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Input file not found: {path}")
+
+    if path.suffix.lower() != ".ride":
+        raise ValueError(f"Expected a .ride file, got: {path}")
+
+    match = re.match(
+        r"^(?P<prefix>.*?)(?P<sep>[_-])(?P<side>left|right)(?P<suffix>\.ride)$",
+        path.name,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError(
+            "Cannot infer sensor side from .ride filename. Expected suffix like '_left.ride' or '_right.ride'. "
+            f"Got: {path.name}"
+        )
+
+    prefix = match.group("prefix")
+    sep = match.group("sep")
+    side = match.group("side").lower()
+    suffix = match.group("suffix")
+
+    if side == "left":
+        left_path = path
+        right_path = path.with_name(f"{prefix}{sep}right{suffix}")
+    else:
+        right_path = path
+        left_path = path.with_name(f"{prefix}{sep}left{suffix}")
+
+    if not left_path.is_file():
+        raise FileNotFoundError(f"Matching LEFT .ride file not found: {left_path}")
+    if not right_path.is_file():
+        raise FileNotFoundError(f"Matching RIGHT .ride file not found: {right_path}")
+    return left_path, right_path
+
+
+def parse_ride_file(ride_path: Path | str, *, device_label: str) -> List[Dict[str, str]]:
+    """Parse a single .ride file into normalized rows.
+
+    The .ride columns are equivalent to the TSV export, but use short names:
+      - AccX/AccY/AccZ -> AccX(g)/AccY(g)/AccZ(g)
+      - AsX/AsY/AsZ    -> AsX(°/s)/AsY(°/s)/AsZ(°/s)
+      - AngX/AngY/AngZ -> AngleX(°)/AngleY(°)/AngleZ(°)
+      - HX/HY/HZ       -> HX(uT)/HY(uT)/HZ(uT)
+
+    The time axis is derived from `timestamp_ms` (Unix epoch milliseconds) and
+    written into the shared `time` column used by the plotting pipeline.
+    """
+
+    path = Path(ride_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Input file not found: {path}")
+
+    normalized_rows: List[Dict[str, str]] = []
+    with path.open(newline="", encoding="utf-8-sig") as fp:
+        reader = csv.DictReader(fp, delimiter=",")
+        for idx, row in enumerate(reader, start=1):
+            ts_ms = row.get("timestamp_ms")
+            if ts_ms is None:
+                raise KeyError(
+                    "Ride file is missing the required 'timestamp_ms' column"
+                )
+            try:
+                ts = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Cannot parse timestamp_ms {ts_ms!r} at row {idx}"
+                ) from exc
+
+            normalized_rows.append(
+                {
+                    "DeviceName": device_label,
+                    TIME_COLUMN: ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    "AccX(g)": row.get("AccX", ""),
+                    "AccY(g)": row.get("AccY", ""),
+                    "AccZ(g)": row.get("AccZ", ""),
+                    "AsX(°/s)": row.get("AsX", ""),
+                    "AsY(°/s)": row.get("AsY", ""),
+                    "AsZ(°/s)": row.get("AsZ", ""),
+                    "AngleX(°)": row.get("AngX", ""),
+                    "AngleY(°)": row.get("AngY", ""),
+                    "AngleZ(°)": row.get("AngZ", ""),
+                    "HX(uT)": row.get("HX", ""),
+                    "HY(uT)": row.get("HY", ""),
+                    "HZ(uT)": row.get("HZ", ""),
+                }
+            )
+
+    timestamped: List[tuple[datetime, Dict[str, str]]] = []
+    for idx, row in enumerate(normalized_rows, start=1):
+        time_value = row.get(TIME_COLUMN)
+        if time_value is None:
+            raise KeyError(
+                f"Ride rows are missing the {TIME_COLUMN!r} column required for sorting"
+            )
+        timestamped.append((parse_timestamp(time_value, idx), row))
+    timestamped.sort(key=lambda pair: pair[0])
+    return [row for _, row in timestamped]
 
 
 def _parse_tabular_file(
@@ -544,7 +668,7 @@ def plot_frequency_spectrum(
         alias = alias_map[device]
         try:
             sample_interval = _estimate_sample_interval(timestamps)
-        except ValueError as exc:
+        except ValueError:
             ax.text(
                 0.5,
                 0.5,
@@ -613,6 +737,10 @@ def device_to_sensor_label(device_name: str, *, fallback: str) -> str:
     Returns:
         A display label such as "LEFT" or "RIGHT".
     """
+
+    normalized = device_name.strip().upper()
+    if normalized in SENSORS:
+        return normalized
 
     for label, identifier in SENSORS.items():
         if identifier and identifier in device_name:
@@ -769,7 +897,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "file",
-        help="Path to the CSV or TSV file to parse",
+        help="Path to the TSV/CSV/.ride file to parse",
     )
     parser.add_argument(
         "-g",
@@ -825,7 +953,20 @@ def main() -> None:
         raise RuntimeError(
             "matplotlib is required for plotting. Install dependencies (e.g. `pip install matplotlib`)."
         )
-    rows_by_device = parse_tsv_file(args.file)
+
+    input_path = Path(args.file).expanduser()
+    suffix = input_path.suffix.lower()
+    if suffix == ".tsv":
+        rows_by_device = parse_tsv_file(input_path)
+    elif suffix == ".csv":
+        rows_by_device = parse_csv_file(input_path)
+    elif suffix == ".ride":
+        rows_by_device = parse_ride_pair(input_path)
+    else:
+        raise ValueError(
+            "Unsupported file extension. Expected one of: .tsv, .csv, .ride. "
+            f"Got: {input_path}"
+        )
     # total_rows = sum(len(rows) for rows in rows_by_device.values())
     # print(f"Parsed {total_rows} rows from {args.file}")
     if rows_by_device:

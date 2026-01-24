@@ -1,6 +1,6 @@
 # sc
 
-Simple command-line utility for plotting sensor data from SC export files.
+Simple command-line utility for plotting sensor data from SC export files (TSV/CSV) and `.ride` captures.
 
 ## _**Installation**_
 
@@ -34,10 +34,10 @@ $ pipx upgrade-all
 ❯ scx --help
 usage: scx [-h] [-g GROUP] [-v] [-ma MA_WINDOW] file
 
-Plot SC sensor export (TSV/CSV) traces by column group
+Plot SC sensor export (TSV/CSV/.ride) traces by column group
 
 positional arguments:
-  file                  Path to the CSV or TSV file to parse
+  file                  Path to the TSV/CSV/.ride file to parse
 
 options:
   -h, --help            show this help message and exit
