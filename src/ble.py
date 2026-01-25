@@ -163,7 +163,7 @@ class WitMotionBleClient:
             yield parse_sensor_packet(raw)
 
 
-async def main() -> None:
+async def _run_main() -> None:
     logging.basicConfig(level=logging.INFO)
     devices = await discover_witmotion_devices()
     if not devices:
@@ -183,5 +183,9 @@ async def main() -> None:
                 break
 
 
+def main() -> None:
+    asyncio.run(_run_main())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
