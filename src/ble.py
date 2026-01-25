@@ -9,13 +9,13 @@ to re-implement the low-level protocol every time.
 """
 
 import asyncio
+import inspect
 import logging
 import struct
 from dataclasses import dataclass
 from typing import AsyncIterator, List, Optional, Tuple
 
 from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakCharacteristicNotFoundError
 from bleak.backends.device import BLEDevice
 
 LOGGER = logging.getLogger(__name__)
@@ -185,9 +185,49 @@ def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
 
 
 def _iter_characteristics(client: BleakClient):
-    for service in client.services:
+    services = getattr(client, "services", None)
+    if not services:
+        return
+
+    for service in services:
         for char in service.characteristics:
             yield service.uuid, char
+
+
+async def _ensure_services_discovered(client: BleakClient) -> None:
+    """Ensure GATT services/characteristics are available on the client.
+
+    Bleak's API differs slightly across versions and backends.
+    """
+
+    services = getattr(client, "services", None)
+    if services:
+        try:
+            if len(services) > 0:
+                return
+        except TypeError:
+            return
+
+    get_services = getattr(client, "get_services", None)
+    if callable(get_services):
+        result = get_services()
+        if inspect.isawaitable(result):
+            await result
+        return
+
+    backend = getattr(client, "_backend", None)
+    if backend is not None:
+        backend_get_services = getattr(backend, "get_services", None)
+        if callable(backend_get_services):
+            result = backend_get_services()
+            if inspect.isawaitable(result):
+                await result
+            return
+
+    raise RuntimeError(
+        "Cannot enumerate GATT services with this Bleak version/backend. "
+        "Try upgrading bleak (and ensure Bluetooth permissions are granted)."
+    )
 
 
 def _pick_io_characteristics(client: BleakClient) -> tuple[str, str]:
@@ -210,9 +250,10 @@ def _pick_io_characteristics(client: BleakClient) -> tuple[str, str]:
         return notify_candidates[0], write_candidates[0]
     if notify_candidates:
         return notify_candidates[0], notify_candidates[0]
-    raise BleakCharacteristicNotFoundError(
-        "No notify/write GATT characteristic found. Available characteristics: "
-        + ", ".join(sorted({c.uuid for _, c in _iter_characteristics(client)}))
+    available = sorted({c.uuid for _, c in _iter_characteristics(client)})
+    raise RuntimeError(
+        "No notify/write GATT characteristic found. "
+        f"Available characteristics: {', '.join(available) if available else '(none)'}"
     )
 
 
@@ -229,7 +270,7 @@ class WitMotionBleClient:
     async def __aenter__(self) -> "WitMotionBleClient":
         self._client = BleakClient(self._device)
         await self._client.connect(timeout=10.0)
-        await self._client.get_services()
+        await _ensure_services_discovered(self._client)
         self._notify_uuid, self._write_uuid = _pick_io_characteristics(self._client)
         LOGGER.info("Using notify=%s write=%s", self._notify_uuid, self._write_uuid)
         LOGGER.info("Connected to %s", self._client.address)
@@ -288,6 +329,13 @@ class WitMotionBleClient:
 
 async def _run_main() -> None:
     logging.basicConfig(level=logging.INFO)
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        LOGGER.info("Using bleak %s", version("bleak"))
+    except PackageNotFoundError:
+        LOGGER.info("Using bleak (version unknown)")
+
     devices = await discover_witmotion_devices()
     print(f"{devices=}")
     if not devices:
