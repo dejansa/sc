@@ -65,6 +65,7 @@ COLUMNS = {
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),  # gyroscope (angular speed)
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),  # magnetometer (magnetic field)
     "q": ("Q0()", "Q1()", "Q2()", "Q3()"),  # quaternion components (sensor orientation)
+    "edge": ("Edge(°)",),  # edging/roll angle around the boot forward axis (derived)
     "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
     "accn": ("AccNorm(g)",),  # normalized acceleration magnitude
     "asn": ("AsNorm(°/s)",), # normalized angular speed magnitude
@@ -107,6 +108,59 @@ def has_quaternion_values(rows_by_device: Dict[str, List[Dict[str, str]]]) -> bo
                     continue
                 return True
     return False
+
+
+def has_quaternion_columns(rows: List[Dict[str, str]]) -> bool:
+    """Return True if the per-row dicts expose all Q0..Q3 columns.
+
+    Some file formats (e.g. `.ride`) never include quaternion columns.
+    """
+
+    if not rows:
+        return False
+    q_columns = COLUMNS["q"]
+    return all(col in rows[0] for col in q_columns)
+
+
+def quaternion_to_edge_deg(q: tuple[float, float, float, float]) -> float:
+    """Compute the boot edging angle (degrees) from an orientation quaternion.
+
+    This follows the approach described in `quart.md`: rotate the world-down
+    gravity vector into the body frame and compute roll about the boot forward
+    axis (assumed to be body +X).
+
+    Assumptions:
+      - Quaternion order is (w, x, y, z)
+      - The quaternion represents body->world rotation
+      - Body axes are: +X forward (along ski), +Y left, +Z up
+
+    Returns:
+        Edging/roll angle in degrees, where positive means rolling toward +Y.
+    """
+
+    qw, qx, qy, qz = q
+
+    # Compute g_body = q*conj applied to world-down vector (0, 0, -1).
+    # We implement: g_body = q_conj * (0, g_world) * q, returning vector part.
+    # This matches the pseudocode from `quart.md`.
+    cw, cx, cy, cz = (qw, -qx, -qy, -qz)
+
+    # vq = (0, 0, 0, -1)
+    vw, vx, vy, vz = (0.0, 0.0, 0.0, -1.0)
+
+    # First multiply: a = conj(q) * vq
+    aw = cw * vw - cx * vx - cy * vy - cz * vz
+    ax = cw * vx + cx * vw + cy * vz - cz * vy
+    ay = cw * vy - cx * vz + cy * vw + cz * vx
+    az = cw * vz + cx * vy - cy * vx + cz * vw
+
+    # Then multiply: b = a * q
+    by = aw * qy - ax * qz + ay * qw + az * qx
+    bz = aw * qz + ax * qy - ay * qx + az * qw
+
+    # Gravity vector in body frame.
+    gy, gz = by, bz
+    return math.degrees(math.atan2(gy, gz))
 
 
 def parse_timestamp(value: str, row_index: int) -> datetime:
@@ -320,16 +374,19 @@ def collect_group_data(
     }
     timestamps: List[datetime] = []
 
-    # Lazy init of AHRS filters so `--help` still works without optional deps.
+    # Lazy init of optional deps so `--help` still works without runtime extras.
     needs_ahrs = any(group in {"mad", "mah", "ekf"} for group in columns_map)
-    if needs_ahrs:
+    needs_edge = "edge" in columns_map
+    edge_uses_quaternion_columns = needs_edge and has_quaternion_columns(rows)
+
+    if needs_ahrs or (needs_edge and not edge_uses_quaternion_columns):
         try:
             import numpy as np
             from ahrs.common.orientation import q2euler
             from ahrs.filters import EKF, Madgwick, Mahony
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "Missing optional dependency for 'mad'/'mah'/'ekf' groups. "
+                "Missing optional dependency for 'mad'/'mah'/'ekf'/'edge' groups. "
                 "Install with `pip install ahrs`."
             ) from exc
 
@@ -350,6 +407,8 @@ def collect_group_data(
         }
         last_dt: float = 0.01
         prev_ts: datetime | None = None
+        edge_filter = Madgwick()
+        edge_q: "np.ndarray" = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
     for idx, row in enumerate(rows, start=1):
         time_value = row.get(TIME_COLUMN)
         if time_value is None:
@@ -367,6 +426,141 @@ def collect_group_data(
             prev_ts = ts
 
         for group, columns in columns_map.items():
+            if group == "edge":
+                if edge_uses_quaternion_columns:
+                    q0 = row.get("Q0()")
+                    q1 = row.get("Q1()")
+                    q2 = row.get("Q2()")
+                    q3 = row.get("Q3()")
+                    if q0 is None or q1 is None or q2 is None or q3 is None:
+                        raise KeyError(
+                            "CSV is missing one of the required quaternion columns: 'Q0()', 'Q1()', 'Q2()', 'Q3()'"
+                        )
+                    try:
+                        qw = float(q0)
+                        qx = float(q1)
+                        qy = float(q2)
+                        qz = float(q3)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Non-numeric entry in quaternion columns at row {idx}"
+                        ) from exc
+                    column_data[group]["Edge(°)"].append(
+                        quaternion_to_edge_deg((qw, qx, qy, qz))
+                    )
+                    continue
+
+                # No quaternions in the input: estimate them from acc+gyro (IMU)
+                # and then compute the edging/roll angle from gravity.
+                ax_val = row.get("AccX(g)")
+                ay_val = row.get("AccY(g)")
+                az_val = row.get("AccZ(g)")
+                gx_val = row.get("AsX(°/s)")
+                gy_val = row.get("AsY(°/s)")
+                gz_val = row.get("AsZ(°/s)")
+                if (
+                    ax_val is None
+                    or ay_val is None
+                    or az_val is None
+                    or gx_val is None
+                    or gy_val is None
+                    or gz_val is None
+                ):
+                    raise KeyError(
+                        "CSV is missing one of the required IMU columns for 'edge': "
+                        "'AccX(g)', 'AccY(g)', 'AccZ(g)', 'AsX(°/s)', 'AsY(°/s)', 'AsZ(°/s)'"
+                    )
+                try:
+                    ax = float(ax_val)
+                    ay = float(ay_val)
+                    az = float(az_val)
+                    gx = float(gx_val)
+                    gy = float(gy_val)
+                    gz = float(gz_val)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Non-numeric entry in IMU columns at row {idx}"
+                    ) from exc
+
+                gyr = np.array(
+                    [
+                        math.radians(gx),
+                        math.radians(gy),
+                        math.radians(gz),
+                    ],
+                    dtype=float,
+                )
+                acc = np.array([ax, ay, az], dtype=float)
+
+                hx_val = row.get("HX(uT)")
+                hy_val = row.get("HY(uT)")
+                hz_val = row.get("HZ(uT)")
+
+                mag_present = False
+                if hx_val is not None and hy_val is not None and hz_val is not None:
+                    hx_s = hx_val.strip()
+                    hy_s = hy_val.strip()
+                    hz_s = hz_val.strip()
+                    if (
+                        hx_s
+                        and hy_s
+                        and hz_s
+                        and hx_s.lower() != "null"
+                        and hy_s.lower() != "null"
+                        and hz_s.lower() != "null"
+                    ):
+                        try:
+                            hx = float(hx_s)
+                            hy = float(hy_s)
+                            hz = float(hz_s)
+                            mag_present = True
+                        except ValueError:
+                            mag_present = False
+
+                # Some logs have duplicate timestamps. Reuse the last observed dt.
+                dt = last_dt if last_dt > 0.0 else 0.01
+
+                # If the acceleration magnitude is invalid, keep the last angle.
+                if float(np.linalg.norm(acc)) == 0.0:
+                    last_value = (
+                        column_data[group]["Edge(°)"][-1]
+                        if column_data[group]["Edge(°)"]
+                        else 0.0
+                    )
+                    column_data[group]["Edge(°)"].append(last_value)
+                    continue
+
+                try:
+                    if mag_present:
+                        mag = np.array([hx, hy, hz], dtype=float)
+                        edge_q = edge_filter.updateMARG(
+                            q=edge_q,
+                            gyr=gyr,
+                            acc=acc,
+                            mag=mag,
+                            dt=dt,
+                        )
+                    else:
+                        edge_q = edge_filter.updateIMU(
+                            q=edge_q,
+                            gyr=gyr,
+                            acc=acc,
+                            dt=dt,
+                        )
+                except Exception:
+                    last_value = (
+                        column_data[group]["Edge(°)"][-1]
+                        if column_data[group]["Edge(°)"]
+                        else 0.0
+                    )
+                    column_data[group]["Edge(°)"].append(last_value)
+                    continue
+
+                qw, qx, qy, qz = (float(edge_q[0]), float(edge_q[1]), float(edge_q[2]), float(edge_q[3]))
+                column_data[group]["Edge(°)"].append(
+                    quaternion_to_edge_deg((qw, qx, qy, qz))
+                )
+                continue
             if group in {"mad", "mah", "ekf"}:
                 ax_val = row.get("AccX(g)")
                 ay_val = row.get("AccY(g)")
@@ -593,7 +787,7 @@ def collect_group_data(
 
     for group, columns in columns_map.items():
         for column in columns:
-            if column.startswith("Angle") or column == "Yaw(°)":
+            if column.startswith("Angle") or column in {"Yaw(°)", "Edge(°)"}:
                 column_data[group][column] = unwrap_degrees(column_data[group][column])
     return timestamps, column_data
 
@@ -947,6 +1141,7 @@ def parse_args() -> argparse.Namespace:
             "as   - angular speed (gyroscope)\n"
             "h    - magnetic field (magnetometer)\n"
             "q    - quaternion components (Q0..Q3)\n"
+            "edge - edging angle around boot forward axis\n"
             "angd - LEFT-RIGHT angle delta\n"
             "accn - acceleration magnitude (norm)\n"
             "asn  - angular speed magnitude (norm)\n"
