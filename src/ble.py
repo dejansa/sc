@@ -1463,6 +1463,13 @@ async def _run_repl(
     selected = await _prompt_select_device(devices)
     print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
 
+    prompt_name = (selected.name or "device").strip() or "device"
+    # Keep prompts short and single-line.
+    prompt_name = "".join(ch for ch in prompt_name if ch.isprintable()).strip()
+    if len(prompt_name) > 24:
+        prompt_name = prompt_name[:24]
+    prompt = f"{prompt_name}> "
+
     async with WitMotionBleClient(selected) as client:
         await client.start_notifications()
         _print_repl_help()
@@ -1471,7 +1478,7 @@ async def _run_repl(
 
         while True:
             try:
-                command = (await _async_input("blex> ")).strip()
+                command = (await _async_input(prompt)).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting.")
                 return 0
