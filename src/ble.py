@@ -148,13 +148,57 @@ class WitMotionMeasurement:
             parts.append(self.datetime.isoformat(sep=" ", timespec="seconds"))
         if self.temperature_c is not None:
             parts.append(f"TEMP(°C)={self.temperature_c:.2f}")
-        if self.power_raw is not None:
-            parts.append(f"POWER(raw)={self.power_raw}")
+            if self.power_raw is not None:
+                percent = battery_percent_from_raw(self.power_raw)
+                if percent is None:
+                    parts.append(f"BAT(raw)={self.power_raw}")
+                else:
+                    parts.append(f"BAT={percent}% (raw={self.power_raw})")
         if self.start_register is not None:
             parts.append(f"reg=0x{self.start_register:02X}")
         if not parts:
             return f"RAW({len(self.raw)}B): {self.raw.hex(' ')}"
         return " | ".join(parts)
+
+
+def battery_percent_from_raw(raw_value: int) -> Optional[int]:
+    """Convert a power register raw value into battery percent.
+
+    The BLE 5.0 protocol doc provides a piecewise mapping from the decimal
+    register value to an approximate battery percentage.
+    """
+
+    if raw_value < 0:
+        return None
+
+    # Thresholds from the WITMOTION BLE 5.0 documentation.
+    if raw_value > 830:
+        return 100
+    if 393 <= raw_value <= 396:
+        return 90
+    if 387 <= raw_value < 393:
+        return 75
+    if 382 <= raw_value < 387:
+        return 60
+    if 379 <= raw_value < 382:
+        return 50
+    if 377 <= raw_value < 379:
+        return 40
+    if 373 <= raw_value < 377:
+        return 30
+    if 370 <= raw_value < 373:
+        return 20
+    if 368 <= raw_value < 370:
+        return 15
+    if 350 <= raw_value < 368:
+        return 10
+    if 340 <= raw_value < 350:
+        return 5
+    if raw_value < 340:
+        return 0
+
+    # Unknown region between 396 and 830.
+    return None
 
 
 async def discover_witmotion_devices(
@@ -599,10 +643,21 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--measurement",
         action="append",
         metavar="TYPE",
-        choices=["acc", "as", "angle", "h", "q", "dt", "temp", "power"],
+        choices=[
+            "acc",
+            "as",
+            "angle",
+            "h",
+            "q",
+            "dt",
+            "temp",
+            "bat",
+            "power",
+            "bias",
+        ],
         help=(
             "Measurement type: acc, as (angular speed), angle, "
-            "h (magnetometer), q (quaternion), dt (datetime), temp, power"
+            "h (magnetometer), q (quaternion), dt (datetime), temp, bat, bias"
         ),
     )
     parser.add_argument(
@@ -709,6 +764,7 @@ def _measurement_register(measurement_type: str) -> Optional[int]:
         "q": 0x51,
         "dt": 0x30,
         "temp": 0x40,
+        "bat": 0x64,
         "power": 0x64,
     }
     return mapping.get(measurement_type)
@@ -749,8 +805,11 @@ def _format_measurement_value(
         return measurement.datetime.isoformat(sep=" ", timespec="seconds")
     if measurement_type == "temp" and measurement.temperature_c is not None:
         return f"TEMP(°C)={measurement.temperature_c:.2f}"
-    if measurement_type == "power" and measurement.power_raw is not None:
-        return f"POWER(raw)={measurement.power_raw}"
+    if measurement_type in {"bat", "power"} and measurement.power_raw is not None:
+        percent = battery_percent_from_raw(measurement.power_raw)
+        if percent is None:
+            return f"BAT(raw)={measurement.power_raw}"
+        return f"BAT={percent}% (raw={measurement.power_raw})"
     return str(measurement)
 
 
@@ -799,7 +858,7 @@ async def _read_measurement_type(
             return measurement.datetime is not None
         if measurement_type == "temp":
             return measurement.temperature_c is not None
-        if measurement_type == "power":
+        if measurement_type in {"bat", "power"}:
             return measurement.power_raw is not None
         return False
 
@@ -911,6 +970,24 @@ async def _run_cli(argv: Optional[List[str]] = None) -> int:
     async with WitMotionBleClient(selected) as client:
         await client.start_notifications()
         for measurement_type in args.measurement:
+            if measurement_type == "bias":
+                w1 = await _read_register_window_i16(
+                    client, start_register=0x05, wait_s=args.wait
+                )
+                w2 = await _read_register_window_i16(
+                    client, start_register=0x0D, wait_s=args.wait
+                )
+                print("bias:")
+                print(f"  AXOFFSET: {w1[0]}")
+                print(f"  AYOFFSET: {w1[1]}")
+                print(f"  AZOFFSET: {w1[2]}")
+                print(f"  GXOFFSET: {w1[3]}")
+                print(f"  GYOFFSET: {w1[4]}")
+                print(f"  GZOFFSET: {w1[5]}")
+                print(f"  HXOFFSET: {w1[6]}")
+                print(f"  HYOFFSET: {w1[7]}")
+                print(f"  HZOFFSET: {w2[0]}")
+                continue
             measurement = await _read_measurement_type(
                 client,
                 measurement_type,
@@ -939,6 +1016,7 @@ def _print_repl_help() -> None:
         "  save         Save current configuration\n"
         "  rate [hz]    Read or set return rate (0.1,0.5,1,2,5,10,20,50,100,200)\n"
         "  baud <bps>   Set baud rate (best-effort; device may ignore)\n"
+        "  bias         Read zero-offset registers (AX..HZ)\n"
         "  acc0 [l|r]   Acceleration zero-offset calibration\n"
         "  gyro0        Angular velocity zero-offset (best-effort)\n"
         "  mag0         Start magnetic field calibration\n"
@@ -947,12 +1025,12 @@ def _print_repl_help() -> None:
         "Measurements (same as -m):\n"
         "  acc          Acceleration\n"
         "  as           Angular speed (gyro)\n"
-        "  angle        Euler angles\n"
+        "  ang          Euler angles\n"
         "  mag          Magnetometer\n"
         "  q            Quaternion\n"
         "  dt           Datetime\n"
         "  temp         Temperature\n"
-        "  power        Power/battery\n"
+        "  bat          Battery level\n"
     )
 
 
@@ -1028,6 +1106,42 @@ async def _read_register_first_u16(
     if last_error is not None:
         raise last_error
     raise RuntimeError("Failed to read register")
+
+
+def _decode_register_window_i16(raw_packet: bytes) -> List[int]:
+    """Decode the 8x int16 register values from a 0x55 0x71 20-byte frame."""
+
+    if len(raw_packet) < BLE_PACKET_SIZE or raw_packet[0] != 0x55 or raw_packet[1] != 0x71:
+        raise ValueError("Not a register-window packet")
+    values: List[int] = []
+    # Values start at byte 4, little-endian signed 16-bit.
+    for offset in range(4, BLE_PACKET_SIZE, 2):
+        values.append(_decode_i16(raw_packet, offset))
+    return values
+
+
+async def _read_register_window_i16(
+    client: WitMotionBleClient,
+    start_register: int,
+    wait_s: float,
+) -> List[int]:
+    """Read a register window and decode 8 signed 16-bit values."""
+
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            await client.write_command(build_read_register_command(start_register))
+            measurement = await client.read_until(
+                lambda m: m.start_register == start_register,
+                timeout_s=wait_s,
+            )
+            return _decode_register_window_i16(measurement.raw)
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to read register window")
 
 
 def _parse_baud(value: str) -> int:
@@ -1133,6 +1247,32 @@ async def _run_repl(
                     print(f"Error: {exc}")
                 continue
 
+            if cmd == "bias":
+                try:
+                    # 0x05 window returns 0x05..0x0C (AX..HY). 0x0D window is HZ.
+                    w1 = await _read_register_window_i16(
+                        client, start_register=0x05, wait_s=wait_s
+                    )
+                    w2 = await _read_register_window_i16(
+                        client, start_register=0x0D, wait_s=wait_s
+                    )
+                    labels = [
+                        ("AXOFFSET", w1[0]),
+                        ("AYOFFSET", w1[1]),
+                        ("AZOFFSET", w1[2]),
+                        ("GXOFFSET", w1[3]),
+                        ("GYOFFSET", w1[4]),
+                        ("GZOFFSET", w1[5]),
+                        ("HXOFFSET", w1[6]),
+                        ("HYOFFSET", w1[7]),
+                        ("HZOFFSET", w2[0]),
+                    ]
+                    for name, value in labels:
+                        print(f"{name}: {value}")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+                continue
+
             if cmd == "rate":
                 if len(cmd_args) == 0:
                     try:
@@ -1231,8 +1371,12 @@ async def _run_repl(
                 cmd = "h"
             if cmd in {"gyro"}:
                 cmd = "as"
+            if cmd in {"ang"}:
+                cmd = "angle"
+            if cmd in {"battery", "bat", "power"}:
+                cmd = "bat"
 
-            if cmd not in {"acc", "as", "angle", "h", "q", "dt", "temp", "power"}:
+            if cmd not in {"acc", "as", "angle", "h", "q", "dt", "temp", "bat"}:
                 print("Unknown command. Type 'help' for options.")
                 continue
 
