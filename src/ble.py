@@ -8,12 +8,15 @@ so you can read IMU data and configure streaming parameters without needing
 to re-implement the low-level protocol every time.
 """
 
+import argparse
 import asyncio
+import datetime as dt
 import inspect
 import logging
 import struct
+import sys
 from dataclasses import dataclass
-from typing import AsyncIterator, List, Optional, Tuple
+from typing import AsyncIterator, Callable, List, Optional, Tuple
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -78,6 +81,8 @@ class WitMotionMeasurement:
     angle: Optional[Tuple[float, float, float]] = None
     mag_mg: Optional[Tuple[int, int, int]] = None
     quat: Optional[Tuple[float, float, float, float]] = None
+    datetime: Optional[dt.datetime] = None
+    power_raw: Optional[int] = None
     start_register: Optional[int] = None
     raw: bytes = b""
 
@@ -103,6 +108,10 @@ class WitMotionMeasurement:
             parts.append(
                 f"Q=({self.quat[0]:.3f},{self.quat[1]:.3f},{self.quat[2]:.3f},{self.quat[3]:.3f})"
             )
+        if self.datetime is not None:
+            parts.append(self.datetime.isoformat(sep=" ", timespec="seconds"))
+        if self.power_raw is not None:
+            parts.append(f"POWER(raw)={self.power_raw}")
         if self.start_register is not None:
             parts.append(f"reg=0x{self.start_register:02X}")
         if not parts:
@@ -117,13 +126,21 @@ async def discover_witmotion_devices(
 
     LOGGER.info("Scanning for WIT MOTION devices (timeout=%.1fs)", timeout)
     devices = await BleakScanner.discover(timeout=timeout)
-    matches = [device for device in devices if name_filter.lower() in (device.name or "").lower()]
+    matches = [
+        device
+        for device in devices
+        if name_filter.lower() in (device.name or "").lower()
+    ]
     LOGGER.info("Found %d matching device(s)", len(matches))
     return matches
 
 
 def _decode_i16(data: bytes, offset: int) -> int:
     return struct.unpack_from("<h", data, offset)[0]
+
+
+def _decode_u16(data: bytes, offset: int) -> int:
+    return struct.unpack_from("<H", data, offset)[0]
 
 
 def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
@@ -180,6 +197,23 @@ def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
                 q2 = _decode_i16(regs, 4) / 32768.0
                 q3 = _decode_i16(regs, 6) / 32768.0
                 measurement.quat = (q0, q1, q2, q3)
+            # Best-effort: datetime often starts at 0x30 as YY MM DD HH mm SS.
+            if reg == 0x30 and len(regs) >= 6:
+                year = 2000 + (regs[0] & 0xFF)
+                month = regs[1] & 0xFF
+                day = regs[2] & 0xFF
+                hour = regs[3] & 0xFF
+                minute = regs[4] & 0xFF
+                second = regs[5] & 0xFF
+                try:
+                    measurement.datetime = dt.datetime(
+                        year, month, day, hour, minute, second
+                    )
+                except ValueError:
+                    pass
+            # Best-effort: power/battery is commonly available around 0x64.
+            if reg == 0x64 and len(regs) >= 2:
+                measurement.power_raw = _decode_u16(regs, 0)
             return measurement
 
     return WitMotionMeasurement(raw=bytes(data))
@@ -430,7 +464,7 @@ class WitMotionBleClient:
         return parse_sensor_packet(raw)
 
     async def start_notifications(self) -> None:
-        print("Starting notifications...")
+        LOGGER.info("Starting notifications...")
         if self._client is None:
             raise RuntimeError("Client is not connected")
         if self._notify_uuid is None:
@@ -440,6 +474,38 @@ class WitMotionBleClient:
             self._notification_queue.put_nowait(bytes(data))
 
         await self._client.start_notify(self._notify_uuid, _handler)
+
+    async def read_until(
+        self,
+        predicate: Callable[[WitMotionMeasurement], bool],
+        timeout_s: float = 3.0,
+    ) -> WitMotionMeasurement:
+        """Wait until a notification matches a predicate.
+
+        Parameters:
+            predicate: Function that returns True for a desired measurement.
+            timeout_s: Maximum seconds to wait.
+
+        Returns:
+            The first matching measurement.
+
+        Raises:
+            TimeoutError: If no matching measurement arrives in time.
+        """
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError("Timed out waiting for measurement")
+            raw = await asyncio.wait_for(
+                self._notification_queue.get(),
+                timeout=remaining,
+            )
+            measurement = parse_sensor_packet(raw)
+            if predicate(measurement):
+                return measurement
 
     async def notification_stream(self) -> AsyncIterator[WitMotionMeasurement]:
         """Yield measurements driven from notification callbacks."""
@@ -451,59 +517,201 @@ class WitMotionBleClient:
             yield parse_sensor_packet(raw)
 
 
-async def _run_main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    from importlib.metadata import PackageNotFoundError, version
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments for the blex tool."""
+
+    parser = argparse.ArgumentParser(prog="blex")
+    parser.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="List discovered WIT MOTION devices",
+    )
+    parser.add_argument(
+        "-d",
+        "--device",
+        metavar="DEVICE",
+        help=(
+            "Device selector: index from --list, BLE address, "
+            "or name substring"
+        ),
+    )
+    parser.add_argument(
+        "-m",
+        "--measurement",
+        action="append",
+        metavar="TYPE",
+        choices=["acc", "as", "angle", "h", "q", "dt", "power"],
+        help=(
+            "Measurement type: acc, as (angular speed), angle, "
+            "h (magnetometer), q (quaternion), dt (datetime), power"
+        ),
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=5.0,
+        help="Scan timeout in seconds (default: 5.0)",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=3.0,
+        help="Per-measurement wait timeout in seconds (default: 3.0)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    return parser.parse_args(argv)
+
+
+def _format_device_line(index: int, device: BLEDevice) -> str:
+    """Format a BLEDevice for human-friendly --list output."""
+
+    name = device.name or "(no name)"
+    return f"{index}: {name} [{device.address}]"
+
+
+def _select_device(devices: List[BLEDevice], selector: Optional[str]) -> BLEDevice:
+    """Select a BLEDevice by index, address, or name substring."""
+
+    if not devices:
+        raise RuntimeError("No devices discovered")
+    if selector is None:
+        return devices[0]
+
+    value = selector.strip()
+
+    # Index
+    try:
+        idx = int(value)
+        if 0 <= idx < len(devices):
+            return devices[idx]
+    except ValueError:
+        pass
+
+    value_lower = value.lower()
+    for device in devices:
+        if (device.address or "").lower() == value_lower:
+            return device
+    for device in devices:
+        if value_lower in (device.name or "").lower():
+            return device
+
+    raise RuntimeError(
+        f"Device '{selector}' not found. Run with --list to see options."
+    )
+
+
+def _measurement_register(measurement_type: str) -> Optional[int]:
+    """Return register to request for a measurement type (or None)."""
+
+    mapping = {
+        "h": 0x3A,
+        "q": 0x51,
+        "dt": 0x30,
+        "power": 0x64,
+    }
+    return mapping.get(measurement_type)
+
+
+async def _read_measurement_type(
+    client: WitMotionBleClient,
+    measurement_type: str,
+    wait_s: float,
+) -> WitMotionMeasurement:
+    """Read a single measurement of a given type."""
+
+    reg = _measurement_register(measurement_type)
+    if reg is not None:
+        try:
+            await client.write_command(build_read_register_command(reg))
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to request %s window (reg=0x%02X): %s",
+                measurement_type,
+                reg,
+                exc,
+            )
+
+    def _matches(measurement: WitMotionMeasurement) -> bool:
+        if measurement_type == "acc":
+            return measurement.acc is not None
+        if measurement_type == "as":
+            return measurement.gyro is not None
+        if measurement_type == "angle":
+            return measurement.angle is not None
+        if measurement_type == "h":
+            return measurement.mag_mg is not None
+        if measurement_type == "q":
+            return measurement.quat is not None
+        if measurement_type == "dt":
+            return measurement.datetime is not None
+        if measurement_type == "power":
+            return measurement.power_raw is not None
+        return False
+
+    return await client.read_until(_matches, timeout_s=wait_s)
+
+
+async def _run_cli(argv: Optional[List[str]] = None) -> int:
+    """Entry point for the blex console script."""
+
+    args = _parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
     try:
-        LOGGER.info("Using bleak %s", version("bleak"))
-    except PackageNotFoundError:
-        LOGGER.info("Using bleak (version unknown)")
+        from importlib.metadata import PackageNotFoundError, version
 
-    devices = await discover_witmotion_devices()
-    print(f"{devices=}")
-    if not devices:
-        print("No WIT MOTION devices discovered. Make sure the sensor is broadcasting BLE signals.")
-        return
-
-    # On Windows, connecting by MAC address can be unreliable. Prefer passing the
-    # BLEDevice object that came from discovery, and try each candidate.
-    last_error: Exception | None = None
-    for selected in devices:
-        print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
         try:
-            async with WitMotionBleClient(selected) as client:
-                await client.start_notifications()
+            LOGGER.info("Using bleak %s", version("bleak"))
+        except PackageNotFoundError:
+            LOGGER.info("Using bleak (version unknown)")
+    except Exception:
+        pass
 
-                # Ask the sensor to return extra register windows (mag/quaternion)
-                # per the BLE 5.0 protocol docs. If the device/OS denies writes,
-                # we still keep streaming default notifications.
-                try:
-                    await client.write_command(build_read_register_command(0x3A))
-                except Exception as exc:
-                    LOGGER.warning("Failed to request magnetometer window: %s", exc)
-                try:
-                    await client.write_command(build_read_register_command(0x51))
-                except Exception as exc:
-                    LOGGER.warning("Failed to request quaternion window: %s", exc)
+    devices = await discover_witmotion_devices(timeout=args.timeout)
 
-                count = 0
-                async for measurement in client.notification_stream():
-                    count += 1
-                    print(f"Notification {count}: {measurement}")
-                    if count >= 3:
-                        return
-        except Exception as exc:
-            last_error = exc
-            print(f"Failed to connect to {selected.address}: {exc}")
-            continue
+    if args.list:
+        if not devices:
+            print("No WIT MOTION devices discovered.")
+            return 1
+        for idx, device in enumerate(devices):
+            print(_format_device_line(idx, device))
+        return 0
 
-    if last_error is not None:
-        raise last_error
+    if not args.measurement:
+        if not devices:
+            print("No WIT MOTION devices discovered.")
+            return 1
+        for idx, device in enumerate(devices):
+            print(_format_device_line(idx, device))
+        print("\nProvide --measurement TYPE to read values.")
+        return 0
+
+    if not devices:
+        print("No WIT MOTION devices discovered.")
+        return 1
+
+    selected = _select_device(devices, args.device)
+    print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
+    async with WitMotionBleClient(selected) as client:
+        await client.start_notifications()
+        for measurement_type in args.measurement:
+            measurement = await _read_measurement_type(
+                client,
+                measurement_type,
+                args.wait,
+            )
+            print(f"{measurement_type}: {measurement}")
+
+    return 0
 
 
 def main() -> None:
-    asyncio.run(_run_main())
+    raise SystemExit(asyncio.run(_run_cli(sys.argv[1:])))
 
 
 if __name__ == "__main__":
