@@ -16,7 +16,7 @@ import logging
 import struct
 import sys
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable, Iterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Iterator, List, Optional, Tuple
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -206,13 +206,69 @@ async def discover_witmotion_devices(
 ) -> List[BLEDevice]:
     """Scan for nearby WIT MOTION peripherals and return matching BLEDevices."""
 
+    # On Windows/WinRT, the same peripheral may advertise sometimes with a local
+    # name and sometimes without one. Bleak's discover() snapshot may end up
+    # returning the last-seen advertisement, which can have an empty name. If we
+    # filter only on device.name from discover(), matches become intermittent.
     LOGGER.info("Scanning for WIT MOTION devices (timeout=%.1fs)", timeout)
-    devices = await BleakScanner.discover(timeout=timeout)
-    matches = [
-        device
-        for device in devices
-        if name_filter.lower() in (device.name or "").lower()
-    ]
+
+    needle = name_filter.lower()
+    best_name_by_address: dict[str, str] = {}
+    device_by_address: dict[str, BLEDevice] = {}
+    matched_addresses: set[str] = set()
+
+    def _on_detect(device: BLEDevice, adv_data: Any) -> None:
+        address = device.address
+        device_by_address[address] = device
+        local_name = ""
+        if adv_data is not None:
+            local_name = (getattr(adv_data, "local_name", None) or "").strip()
+
+        candidate = local_name or (device.name or "").strip()
+        if candidate:
+            if not best_name_by_address.get(address):
+                best_name_by_address[address] = candidate
+        if needle in candidate.lower():
+            matched_addresses.add(address)
+
+    scanner: Any
+    try:
+        scanner = BleakScanner()
+        register_cb = getattr(scanner, "register_detection_callback", None)
+        if callable(register_cb):
+            register_cb(_on_detect)
+        else:
+            scanner = BleakScanner(detection_callback=_on_detect)
+
+        await scanner.start()
+        await asyncio.sleep(timeout)
+        await scanner.stop()
+    except Exception as exc:
+        LOGGER.debug(
+            "Falling back to BleakScanner.discover due to scanner error: %s", exc
+        )
+        devices = await BleakScanner.discover(timeout=timeout)
+        for device in devices:
+            device_by_address[device.address] = device
+            candidate = (device.name or "").strip()
+            if candidate and not best_name_by_address.get(device.address):
+                best_name_by_address[device.address] = candidate
+            if needle in candidate.lower():
+                matched_addresses.add(device.address)
+
+    matches: List[BLEDevice] = []
+    for address in matched_addresses:
+        device = device_by_address.get(address)
+        if device is None:
+            continue
+        best_name = best_name_by_address.get(address, "").strip()
+        if best_name and not (device.name or "").strip():
+            try:
+                device.name = best_name
+            except Exception:
+                pass
+        matches.append(device)
+
     LOGGER.info("Found %d matching device(s)", len(matches))
     return matches
 
