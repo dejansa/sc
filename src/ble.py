@@ -16,7 +16,7 @@ import logging
 import struct
 import sys
 from dataclasses import dataclass
-from typing import AsyncIterator, Callable, List, Optional, Tuple
+from typing import AsyncIterator, Callable, Iterator, List, Optional, Tuple
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -143,25 +143,33 @@ def _decode_u16(data: bytes, offset: int) -> int:
     return struct.unpack_from("<H", data, offset)[0]
 
 
-def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
-    """Parse a single BLE 5.0 packet (up to 20 bytes).
+def iter_sensor_measurements(data: bytes) -> Iterator[WitMotionMeasurement]:
+    """Iterate decoded measurements found within a raw notification payload.
+
+    Some firmware versions batch multiple 20-byte frames into one BLE
+    notification. This yields each recognized frame rather than only the first.
 
     Per GitBook:
-      - 0x55 0x61: default 20-byte packet with acc + gyro + angle (18 bytes payload)
-      - 0x55 0x71: register window (start register + 8 registers = 20 bytes total)
+      - 0x55 0x61: default 20-byte packet with acc + gyro + angle
+      - 0x55 0x71: register window (start register + 8 registers)
     """
 
     if not data:
-        return WitMotionMeasurement(raw=b"")
-    # Notifications can deliver more than one 20B frame at once.
-    # Parse the first valid one we find.
-    for start in range(0, max(1, len(data) - 1)):
-        if start + 2 > len(data) or data[start] != 0x55:
+        yield WitMotionMeasurement(raw=b"")
+        return
+
+    offset = 0
+    yielded = False
+    while offset + 2 <= len(data):
+        if data[offset] != 0x55:
+            offset += 1
             continue
-        flag = data[start + 1]
-        if start + BLE_PACKET_SIZE > len(data):
-            continue
-        packet = data[start : start + BLE_PACKET_SIZE]
+        if offset + BLE_PACKET_SIZE > len(data):
+            break
+
+        flag = data[offset + 1]
+        packet = data[offset : offset + BLE_PACKET_SIZE]
+        offset += BLE_PACKET_SIZE
 
         if flag == 0x61:
             ax = _decode_i16(packet, 2) * ACC_SCALE
@@ -173,19 +181,19 @@ def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
             roll = _decode_i16(packet, 14) * ANGLE_SCALE
             pitch = _decode_i16(packet, 16) * ANGLE_SCALE
             yaw = _decode_i16(packet, 18) * ANGLE_SCALE
-            return WitMotionMeasurement(
+            yielded = True
+            yield WitMotionMeasurement(
                 acc=(ax, ay, az),
                 gyro=(gx, gy, gz),
                 angle=(roll, pitch, yaw),
                 raw=packet,
             )
+            continue
 
         if flag == 0x71:
             reg = packet[2] | (packet[3] << 8)
-            # 8 registers, 2 bytes each.
             regs = packet[4:]
             measurement = WitMotionMeasurement(start_register=reg, raw=packet)
-            # Known windows
             if reg == 0x3A and len(regs) >= 6:
                 hx = _decode_i16(regs, 0)
                 hy = _decode_i16(regs, 2)
@@ -197,7 +205,6 @@ def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
                 q2 = _decode_i16(regs, 4) / 32768.0
                 q3 = _decode_i16(regs, 6) / 32768.0
                 measurement.quat = (q0, q1, q2, q3)
-            # Best-effort: datetime often starts at 0x30 as YY MM DD HH mm SS.
             if reg == 0x30 and len(regs) >= 6:
                 year = 2000 + (regs[0] & 0xFF)
                 month = regs[1] & 0xFF
@@ -211,11 +218,21 @@ def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
                     )
                 except ValueError:
                     pass
-            # Best-effort: power/battery is commonly available around 0x64.
             if reg == 0x64 and len(regs) >= 2:
                 measurement.power_raw = _decode_u16(regs, 0)
-            return measurement
+            yielded = True
+            yield measurement
+            continue
 
+    if not yielded:
+        yield WitMotionMeasurement(raw=bytes(data))
+
+
+def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
+    """Parse the first decoded measurement from a raw payload."""
+
+    for measurement in iter_sensor_measurements(data):
+        return measurement
     return WitMotionMeasurement(raw=bytes(data))
 
 
@@ -503,9 +520,9 @@ class WitMotionBleClient:
                 self._notification_queue.get(),
                 timeout=remaining,
             )
-            measurement = parse_sensor_packet(raw)
-            if predicate(measurement):
-                return measurement
+            for measurement in iter_sensor_measurements(raw):
+                if predicate(measurement):
+                    return measurement
 
     async def notification_stream(self) -> AsyncIterator[WitMotionMeasurement]:
         """Yield measurements driven from notification callbacks."""
@@ -514,7 +531,8 @@ class WitMotionBleClient:
             raise RuntimeError("Client is not connected")
         while self._client.is_connected:
             raw = await self._notification_queue.get()
-            yield parse_sensor_packet(raw)
+            for measurement in iter_sensor_measurements(raw):
+                yield measurement
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -607,6 +625,8 @@ def _select_device(
     """
 
     if not devices:
+        if selector is not None and _looks_like_mac_address(selector.strip()):
+            return selector.strip()
         raise RuntimeError("No devices discovered")
     if selector is None:
         return devices[0]
@@ -720,16 +740,6 @@ async def _read_measurement_type(
     """Read a single measurement of a given type."""
 
     reg = _measurement_register(measurement_type)
-    if reg is not None:
-        try:
-            await client.write_command(build_read_register_command(reg))
-        except Exception as exc:
-            LOGGER.warning(
-                "Failed to request %s window (reg=0x%02X): %s",
-                measurement_type,
-                reg,
-                exc,
-            )
 
     def _matches(measurement: WitMotionMeasurement) -> bool:
         if measurement_type == "acc":
@@ -748,7 +758,32 @@ async def _read_measurement_type(
             return measurement.power_raw is not None
         return False
 
-    return await client.read_until(_matches, timeout_s=wait_s)
+    if reg is None:
+        return await client.read_until(_matches, timeout_s=wait_s)
+
+    # Register-based measurements are often returned as a separate 0x71 frame,
+    # and some firmware sends them only intermittently. Retry a few times.
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            await client.write_command(build_read_register_command(reg))
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to request %s window (reg=0x%02X) attempt %d: %s",
+                measurement_type,
+                reg,
+                attempt,
+                exc,
+            )
+        try:
+            return await client.read_until(_matches, timeout_s=wait_s)
+        except TimeoutError as exc:
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise TimeoutError("Timed out waiting for measurement")
 
 
 async def _run_cli(argv: Optional[List[str]] = None) -> int:
