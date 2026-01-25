@@ -598,6 +598,57 @@ class WitMotionBleClient:
                 removed += 1
         return removed
 
+    async def read_latest(
+        self,
+        predicate: Callable[[WitMotionMeasurement], bool],
+        timeout_s: float = 3.0,
+        settle_s: float = 0.15,
+    ) -> WitMotionMeasurement:
+        """Read the newest measurement matching predicate.
+
+        This waits for the first matching measurement, then keeps consuming
+        notifications for a short "settle" window and returns the last matching
+        sample seen. This avoids returning a transient cached/old sample when a
+        device begins streaming.
+        """
+
+        loop = asyncio.get_running_loop()
+        overall_deadline = loop.time() + timeout_s
+        last_match: WitMotionMeasurement | None = None
+
+        # Phase 1: wait for at least one match.
+        while loop.time() < overall_deadline and last_match is None:
+            remaining = overall_deadline - loop.time()
+            if remaining <= 0:
+                break
+            raw = await asyncio.wait_for(self._notification_queue.get(), remaining)
+            for measurement in iter_sensor_measurements(raw):
+                if predicate(measurement):
+                    last_match = measurement
+                    break
+
+        if last_match is None:
+            raise TimeoutError("Timed out waiting for measurement")
+
+        # Phase 2: keep the newest match for a short settle window.
+        settle_deadline = loop.time() + max(0.0, settle_s)
+        while loop.time() < settle_deadline:
+            remaining = settle_deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(
+                    self._notification_queue.get(), timeout=remaining
+                )
+            except TimeoutError:
+                break
+            for measurement in iter_sensor_measurements(raw):
+                if predicate(measurement):
+                    last_match = measurement
+                    settle_deadline = loop.time() + max(0.0, settle_s)
+
+        return last_match
+
     async def __aenter__(self) -> "WitMotionBleClient":
         self._client = BleakClient(self._device)
         await self._client.connect(timeout=10.0)
@@ -988,7 +1039,19 @@ async def _read_measurement_type(
     if reg is None:
         # Drop any backlog so we read the freshest sample after this command.
         client.clear_pending_notifications()
-        return await client.read_until(_matches, timeout_s=wait_s)
+
+        # Some firmware updates the notify characteristic value with the latest
+        # sample and allows direct reads; this avoids any buffering issues.
+        if measurement_type in {"acc", "as", "angle"}:
+            try:
+                for _ in range(2):
+                    polled = await client.read_measurement()
+                    if _matches(polled):
+                        return polled
+            except Exception:
+                pass
+
+        return await client.read_latest(_matches, timeout_s=wait_s)
 
     # Register-based measurements are often returned as a separate 0x71 frame,
     # and some firmware sends them only intermittently. Retry a few times.
@@ -1006,7 +1069,7 @@ async def _read_measurement_type(
                 exc,
             )
         try:
-            return await client.read_until(_matches, timeout_s=wait_s)
+            return await client.read_latest(_matches, timeout_s=wait_s)
         except TimeoutError as exc:
             last_error = exc
             continue
@@ -1145,6 +1208,7 @@ def _print_repl_help() -> None:
         "  save         Save current configuration\n"
         "  rate [hz]    Read or set return rate (0.1,0.5,1,2,5,10,20,50,100,200)\n"
         "  baud <bps>   Set baud rate (best-effort; device may ignore)\n"
+        "  watch [on|off]  Toggle watch mode (default: off)\n"
         "  bias         Read zero-offset registers (AX..HZ)\n"
         "  acc0 [l|r]   Acceleration zero-offset calibration\n"
         "  gyro0        Angular velocity zero-offset (best-effort)\n"
@@ -1161,6 +1225,56 @@ def _print_repl_help() -> None:
         "  temp         Temperature\n"
         "  bat          Battery level\n"
     )
+
+
+async def _wait_for_esc(timeout_s: float) -> bool:
+    """Return True if ESC was pressed within timeout_s.
+
+    Best-effort cross-platform implementation:
+    - Windows: uses msvcrt to poll keyboard.
+    - POSIX: temporarily puts stdin in cbreak mode and polls via select().
+    """
+
+    if timeout_s <= 0:
+        return False
+
+    if sys.platform.startswith("win"):
+        try:
+            import msvcrt  # type: ignore
+        except Exception:
+            await asyncio.sleep(timeout_s)
+            return False
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch == b"\x1b":
+                    return True
+            await asyncio.sleep(0.05)
+        return False
+
+    # POSIX
+    try:
+        import select
+        import termios
+        import tty
+    except Exception:
+        await asyncio.sleep(timeout_s)
+        return False
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        rlist, _, _ = select.select([sys.stdin], [], [], timeout_s)
+        if rlist:
+            ch = sys.stdin.read(1)
+            return ch == "\x1b"
+        return False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def _parse_rate_hz(value: str) -> int:
@@ -1353,6 +1467,8 @@ async def _run_repl(
         await client.start_notifications()
         _print_repl_help()
 
+        watch_enabled = False
+
         while True:
             try:
                 command = (await _async_input("blex> ")).strip()
@@ -1370,6 +1486,17 @@ async def _run_repl(
                 return 0
             if cmd in {"help", "?", "h"}:
                 _print_repl_help()
+                continue
+
+            if cmd == "watch":
+                if len(cmd_args) == 0:
+                    print(f"watch is {'on' if watch_enabled else 'off'}")
+                    continue
+                if len(cmd_args) == 1 and cmd_args[0].lower() in {"on", "off"}:
+                    watch_enabled = cmd_args[0].lower() == "on"
+                    print(f"watch {'enabled' if watch_enabled else 'disabled'}")
+                    continue
+                print("Usage: watch [on|off]")
                 continue
 
             if cmd == "save":
@@ -1511,6 +1638,22 @@ async def _run_repl(
 
             if cmd not in {"acc", "as", "angle", "h", "q", "dt", "temp", "bat"}:
                 print("Unknown command. Type 'help' for options.")
+                continue
+
+            if watch_enabled:
+                print("Watching. Press ESC to stop.")
+                while True:
+                    try:
+                        measurement = await _read_measurement_type(client, cmd, wait_s)
+                        print(_format_measurement_value(cmd, measurement))
+                    except TimeoutError:
+                        print(f"Timed out waiting for {cmd}. Try again.")
+                    except Exception as exc:
+                        print(f"Error: {exc}")
+                        break
+
+                    if await _wait_for_esc(1.0):
+                        break
                 continue
 
             # For Windows devices that go quiet, try to re-request by register a
