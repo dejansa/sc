@@ -37,6 +37,41 @@ ANGLE_SCALE = 180.0 / 32768.0
 REGISTER_READ_PREFIX = bytes([0xFF, 0xAA, 0x27])
 
 
+def build_set_baud_command(baud_code: int) -> bytes:
+    """Build a command to set the serial baud rate.
+
+    Protocol: FF AA 04 BAUD 00
+
+    Note: This configures the module's serial baud register; some BLE-only
+    devices may ignore it.
+    """
+
+    if not 0 <= baud_code <= 0xFF:
+        raise ValueError("baud_code must fit in one byte")
+    return bytes([0xFF, 0xAA, 0x04, baud_code, 0x00])
+
+
+def build_calibration_command(code: int) -> bytes:
+    """Build a calibration/zero-offset command.
+
+    Protocol: FF AA 01 CAL 00
+
+    Known values from the BLE 5.0 protocol documentation:
+      - 0x01: acceleration calibration
+      - 0x05: acceleration calibration L
+      - 0x06: acceleration calibration R
+      - 0x07: magnetic field calibration (start)
+      - 0x00: complete magnetic field calibration
+
+    Some devices also support a gyro zero-offset command, but it is not listed
+    in the docs we reference; this tool may be best-effort.
+    """
+
+    if not 0 <= code <= 0xFF:
+        raise ValueError("code must fit in one byte")
+    return bytes([0xFF, 0xAA, 0x01, code, 0x00])
+
+
 def build_read_register_command(register: int) -> bytes:
     """Build a BLE 5.0 command to read a register window.
 
@@ -82,6 +117,7 @@ class WitMotionMeasurement:
     mag_mg: Optional[Tuple[int, int, int]] = None
     quat: Optional[Tuple[float, float, float, float]] = None
     datetime: Optional[dt.datetime] = None
+    temperature_c: Optional[float] = None
     power_raw: Optional[int] = None
     start_register: Optional[int] = None
     raw: bytes = b""
@@ -110,6 +146,8 @@ class WitMotionMeasurement:
             )
         if self.datetime is not None:
             parts.append(self.datetime.isoformat(sep=" ", timespec="seconds"))
+        if self.temperature_c is not None:
+            parts.append(f"TEMP(°C)={self.temperature_c:.2f}")
         if self.power_raw is not None:
             parts.append(f"POWER(raw)={self.power_raw}")
         if self.start_register is not None:
@@ -220,6 +258,8 @@ def iter_sensor_measurements(data: bytes) -> Iterator[WitMotionMeasurement]:
                     pass
             if reg == 0x64 and len(regs) >= 2:
                 measurement.power_raw = _decode_u16(regs, 0)
+            if reg == 0x40 and len(regs) >= 2:
+                measurement.temperature_c = _decode_i16(regs, 0) / 100.0
             yielded = True
             yield measurement
             continue
@@ -559,10 +599,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--measurement",
         action="append",
         metavar="TYPE",
-        choices=["acc", "as", "angle", "h", "q", "dt", "power"],
+        choices=["acc", "as", "angle", "h", "q", "dt", "temp", "power"],
         help=(
             "Measurement type: acc, as (angular speed), angle, "
-            "h (magnetometer), q (quaternion), dt (datetime), power"
+            "h (magnetometer), q (quaternion), dt (datetime), temp, power"
         ),
     )
     parser.add_argument(
@@ -668,6 +708,7 @@ def _measurement_register(measurement_type: str) -> Optional[int]:
         "h": 0x3A,
         "q": 0x51,
         "dt": 0x30,
+        "temp": 0x40,
         "power": 0x64,
     }
     return mapping.get(measurement_type)
@@ -706,6 +747,8 @@ def _format_measurement_value(
         )
     if measurement_type == "dt" and measurement.datetime is not None:
         return measurement.datetime.isoformat(sep=" ", timespec="seconds")
+    if measurement_type == "temp" and measurement.temperature_c is not None:
+        return f"TEMP(°C)={measurement.temperature_c:.2f}"
     if measurement_type == "power" and measurement.power_raw is not None:
         return f"POWER(raw)={measurement.power_raw}"
     return str(measurement)
@@ -754,6 +797,8 @@ async def _read_measurement_type(
             return measurement.quat is not None
         if measurement_type == "dt":
             return measurement.datetime is not None
+        if measurement_type == "temp":
+            return measurement.temperature_c is not None
         if measurement_type == "power":
             return measurement.power_raw is not None
         return False
@@ -891,6 +936,13 @@ def _print_repl_help() -> None:
         "Commands:\n"
         "  h, ?, help   Show this help\n"
         "  exit, quit   Disconnect and exit\n"
+        "  save         Save current configuration\n"
+        "  rate <hz>    Set return rate (0.1,0.5,1,2,5,10,20,50,100,200)\n"
+        "  baud <bps>   Set baud rate (best-effort; device may ignore)\n"
+        "  acc0 [l|r]   Acceleration zero-offset calibration\n"
+        "  gyro0        Angular velocity zero-offset (best-effort)\n"
+        "  mag0         Start magnetic field calibration\n"
+        "  mag0 done    Complete magnetic field calibration\n"
         "\n"
         "Measurements (same as -m):\n"
         "  acc          Acceleration\n"
@@ -899,7 +951,66 @@ def _print_repl_help() -> None:
         "  mag          Magnetometer\n"
         "  q            Quaternion\n"
         "  dt           Datetime\n"
+        "  temp         Temperature\n"
         "  power        Power/battery\n"
+    )
+
+
+def _parse_rate_hz(value: str) -> int:
+    """Map a user-specified Hz value to the protocol RATE code."""
+
+    hz_to_code = {
+        0.1: 0x01,
+        0.5: 0x02,
+        1.0: 0x03,
+        2.0: 0x04,
+        5.0: 0x05,
+        10.0: 0x06,
+        20.0: 0x07,
+        50.0: 0x08,
+        100.0: 0x09,
+        200.0: 0x0A,
+    }
+
+    try:
+        hz = float(value)
+    except ValueError as exc:
+        raise ValueError("rate must be a number") from exc
+
+    if hz in hz_to_code:
+        return hz_to_code[hz]
+    raise ValueError(
+        "Unsupported rate. Use one of: 0.1 0.5 1 2 5 10 20 50 100 200"
+    )
+
+
+def _parse_baud(value: str) -> int:
+    """Map a user-specified baud rate to a BAUD code.
+
+    The BLE 5.0 doc shows BAUD as a register but doesn't list codes here.
+    This mapping follows common WITMOTION conventions; if your device uses a
+    different mapping, pass a raw code as hex (e.g. 0x04).
+    """
+
+    value = value.strip().lower()
+    if value.startswith("0x"):
+        return int(value, 16)
+
+    bps = int(value)
+    bps_to_code = {
+        9600: 0,
+        19200: 1,
+        38400: 2,
+        57600: 3,
+        115200: 4,
+        230400: 5,
+        460800: 6,
+        921600: 7,
+    }
+    if bps in bps_to_code:
+        return bps_to_code[bps]
+    raise ValueError(
+        "Unsupported baud. Use 9600/19200/38400/57600/115200 or a raw code like 0x04"
     )
 
 
@@ -959,11 +1070,94 @@ async def _run_repl(
             if not command:
                 continue
 
-            cmd = command.lower()
+            parts = command.split()
+            cmd = parts[0].lower()
+            cmd_args = parts[1:]
             if cmd in {"exit", "quit"}:
                 return 0
             if cmd in {"help", "?", "h"}:
                 _print_repl_help()
+                continue
+
+            if cmd == "save":
+                try:
+                    await client.write_command(build_save_config_command(0))
+                    print("Saved configuration.")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+                continue
+
+            if cmd == "rate":
+                if len(cmd_args) != 1:
+                    print("Usage: rate <hz>")
+                    continue
+                try:
+                    rate_code = _parse_rate_hz(cmd_args[0])
+                    await client.write_command(build_set_rate_command(rate_code))
+                    await client.write_command(build_save_config_command(0))
+                    print(f"Set rate to {cmd_args[0]} Hz (code=0x{rate_code:02X}).")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+                continue
+
+            if cmd == "baud":
+                if len(cmd_args) != 1:
+                    print("Usage: baud <bps|0xCODE>")
+                    continue
+                try:
+                    baud_code = _parse_baud(cmd_args[0])
+                    await client.write_command(build_set_baud_command(baud_code))
+                    await client.write_command(build_save_config_command(0))
+                    print(
+                        f"Set baud to {cmd_args[0]} (code=0x{baud_code:02X})."
+                    )
+                except Exception as exc:
+                    print(f"Error: {exc}")
+                continue
+
+            if cmd == "acc0":
+                cal_code = 0x01
+                if cmd_args:
+                    arg = cmd_args[0].lower()
+                    if arg == "l":
+                        cal_code = 0x05
+                    elif arg == "r":
+                        cal_code = 0x06
+                    else:
+                        print("Usage: acc0 [l|r]")
+                        continue
+                try:
+                    await client.write_command(build_calibration_command(cal_code))
+                    await client.write_command(build_save_config_command(0))
+                    print(f"Acceleration calibration sent (code=0x{cal_code:02X}).")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+                continue
+
+            if cmd == "gyro0":
+                # Best-effort: not listed in the BLE 5.0 page we reference.
+                # Many devices use 0x02 for gyro zero-offset.
+                try:
+                    await client.write_command(build_calibration_command(0x02))
+                    await client.write_command(build_save_config_command(0))
+                    print("Gyro zero-offset command sent (code=0x02, best-effort).")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+                continue
+
+            if cmd == "mag0":
+                cal_code = 0x07
+                if cmd_args and cmd_args[0].lower() in {"done", "finish", "end"}:
+                    cal_code = 0x00
+                try:
+                    await client.write_command(build_calibration_command(cal_code))
+                    await client.write_command(build_save_config_command(0))
+                    if cal_code == 0x07:
+                        print("Mag calibration started. Rotate the sensor, then run: mag0 done")
+                    else:
+                        print("Mag calibration completed.")
+                except Exception as exc:
+                    print(f"Error: {exc}")
                 continue
 
             # Aliases
@@ -972,7 +1166,7 @@ async def _run_repl(
             if cmd in {"gyro"}:
                 cmd = "as"
 
-            if cmd not in {"acc", "as", "angle", "h", "q", "dt", "power"}:
+            if cmd not in {"acc", "as", "angle", "h", "q", "dt", "temp", "power"}:
                 print("Unknown command. Type 'help' for options.")
                 continue
 
