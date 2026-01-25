@@ -554,6 +554,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Scan timeout in seconds (default: 5.0)",
     )
     parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="How many scan attempts to find a device (default: 3)",
+    )
+    parser.add_argument(
         "--wait",
         type=float,
         default=3.0,
@@ -647,6 +653,65 @@ def _measurement_register(measurement_type: str) -> Optional[int]:
     return mapping.get(measurement_type)
 
 
+def _format_measurement_value(
+    measurement_type: str,
+    measurement: WitMotionMeasurement,
+) -> str:
+    """Format only the requested field from a decoded measurement."""
+
+    if measurement_type == "acc" and measurement.acc is not None:
+        return (
+            f"ACC(g)=({measurement.acc[0]:.3f},"
+            f"{measurement.acc[1]:.3f},{measurement.acc[2]:.3f})"
+        )
+    if measurement_type == "as" and measurement.gyro is not None:
+        return (
+            f"GYRO(°/s)=({measurement.gyro[0]:.1f},"
+            f"{measurement.gyro[1]:.1f},{measurement.gyro[2]:.1f})"
+        )
+    if measurement_type == "angle" and measurement.angle is not None:
+        return (
+            f"ANGLE(°)=({measurement.angle[0]:.1f},"
+            f"{measurement.angle[1]:.1f},{measurement.angle[2]:.1f})"
+        )
+    if measurement_type == "h" and measurement.mag_mg is not None:
+        return (
+            f"MAG(mG)=({measurement.mag_mg[0]},"
+            f"{measurement.mag_mg[1]},{measurement.mag_mg[2]})"
+        )
+    if measurement_type == "q" and measurement.quat is not None:
+        return (
+            f"Q=({measurement.quat[0]:.3f},{measurement.quat[1]:.3f},"
+            f"{measurement.quat[2]:.3f},{measurement.quat[3]:.3f})"
+        )
+    if measurement_type == "dt" and measurement.datetime is not None:
+        return measurement.datetime.isoformat(sep=" ", timespec="seconds")
+    if measurement_type == "power" and measurement.power_raw is not None:
+        return f"POWER(raw)={measurement.power_raw}"
+    return str(measurement)
+
+
+async def _find_device_by_address(
+    address: str,
+    timeout: float,
+    retries: int,
+) -> Optional[BLEDevice]:
+    """Try to resolve a BLEDevice by address with scan retries."""
+
+    find_fn = getattr(BleakScanner, "find_device_by_address", None)
+    for _ in range(max(1, retries)):
+        if callable(find_fn):
+            found = await find_fn(address, timeout=timeout)
+            if found is not None:
+                return found
+        else:
+            devices = await BleakScanner.discover(timeout=timeout)
+            for device in devices:
+                if (device.address or "").lower() == address.lower():
+                    return device
+    return None
+
+
 async def _read_measurement_type(
     client: WitMotionBleClient,
     measurement_type: str,
@@ -736,8 +801,22 @@ async def _run_cli(argv: Optional[List[str]] = None) -> int:
         raise
 
     if isinstance(selected, str):
-        print(f"Using address {selected}")
-    else:
+        if sys.platform.startswith("win"):
+            found = await _find_device_by_address(
+                selected,
+                timeout=args.timeout,
+                retries=args.retries,
+            )
+            if found is None:
+                raise RuntimeError(
+                    f"Device with address {selected} was not found in scans. "
+                    "Wake the sensor and retry (or use --list and pass an index)."
+                )
+            selected = found
+        else:
+            print(f"Using address {selected}")
+
+    if not isinstance(selected, str):
         print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
 
     async with WitMotionBleClient(selected) as client:
@@ -748,7 +827,10 @@ async def _run_cli(argv: Optional[List[str]] = None) -> int:
                 measurement_type,
                 args.wait,
             )
-            print(f"{measurement_type}: {measurement}")
+            print(
+                f"{measurement_type}: "
+                f"{_format_measurement_value(measurement_type, measurement)}"
+            )
 
     return 0
 
