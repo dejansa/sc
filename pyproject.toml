@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 scx = "cli:main"
+blex = "ble:main"
 
 [build-system]
 requires = ["setuptools>=65.5.0", "wheel"]
