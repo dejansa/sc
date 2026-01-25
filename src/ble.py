@@ -145,6 +145,7 @@ class WitMotionBleClient:
         return parse_sensor_packet(raw)
 
     async def start_notifications(self) -> None:
+        print("Starting notifications...")
         if self._client is None:
             raise RuntimeError("Client is not connected")
 
@@ -166,6 +167,7 @@ class WitMotionBleClient:
 async def _run_main() -> None:
     logging.basicConfig(level=logging.INFO)
     devices = await discover_witmotion_devices()
+    print(f"{devices=}")
     if not devices:
         print("No WIT MOTION devices discovered. Make sure the sensor is broadcasting BLE signals.")
         return
