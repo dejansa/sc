@@ -574,8 +574,31 @@ def _format_device_line(index: int, device: BLEDevice) -> str:
     return f"{index}: {name} [{device.address}]"
 
 
-def _select_device(devices: List[BLEDevice], selector: Optional[str]) -> BLEDevice:
-    """Select a BLEDevice by index, address, or name substring."""
+def _looks_like_mac_address(value: str) -> bool:
+    """Return True if value looks like a Bluetooth MAC address."""
+
+    parts = value.split(":")
+    if len(parts) != 6:
+        return False
+    for part in parts:
+        if len(part) != 2:
+            return False
+        try:
+            int(part, 16)
+        except ValueError:
+            return False
+    return True
+
+
+def _select_device(
+    devices: List[BLEDevice],
+    selector: Optional[str],
+) -> BLEDevice | str:
+    """Select a device by index, address, or name substring.
+
+    If selector looks like a MAC address but isn't found in the scan results,
+    return the address string and let Bleak attempt a best-effort connect.
+    """
 
     if not devices:
         raise RuntimeError("No devices discovered")
@@ -599,6 +622,13 @@ def _select_device(devices: List[BLEDevice], selector: Optional[str]) -> BLEDevi
     for device in devices:
         if value_lower in (device.name or "").lower():
             return device
+
+    if _looks_like_mac_address(value):
+        LOGGER.warning(
+            "Device %s not discovered in this scan; trying direct connect by address.",
+            value,
+        )
+        return value
 
     raise RuntimeError(
         f"Device '{selector}' not found. Run with --list to see options."
@@ -695,8 +725,21 @@ async def _run_cli(argv: Optional[List[str]] = None) -> int:
         print("No WIT MOTION devices discovered.")
         return 1
 
-    selected = _select_device(devices, args.device)
-    print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
+    try:
+        selected = _select_device(devices, args.device)
+    except RuntimeError as exc:
+        if devices:
+            print(str(exc))
+            print("Discovered devices:")
+            for idx, device in enumerate(devices):
+                print(_format_device_line(idx, device))
+        raise
+
+    if isinstance(selected, str):
+        print(f"Using address {selected}")
+    else:
+        print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
+
     async with WitMotionBleClient(selected) as client:
         await client.start_notifications()
         for measurement_type in args.measurement:
