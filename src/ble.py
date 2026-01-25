@@ -173,9 +173,6 @@ async def _run_main() -> None:
     selected = devices[0]
     print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
     async with WitMotionBleClient(selected.address) as client:
-        measurement = await client.read_measurement()
-        print("One-shot measurement:", measurement)
-
         await client.start_notifications()
         async for idx, measurement in enumerate(client.notification_stream()):
             print(f"Notification {idx + 1}: {measurement}")
