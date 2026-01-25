@@ -937,7 +937,7 @@ def _print_repl_help() -> None:
         "  h, ?, help   Show this help\n"
         "  exit, quit   Disconnect and exit\n"
         "  save         Save current configuration\n"
-        "  rate <hz>    Set return rate (0.1,0.5,1,2,5,10,20,50,100,200)\n"
+        "  rate [hz]    Read or set return rate (0.1,0.5,1,2,5,10,20,50,100,200)\n"
         "  baud <bps>   Set baud rate (best-effort; device may ignore)\n"
         "  acc0 [l|r]   Acceleration zero-offset calibration\n"
         "  gyro0        Angular velocity zero-offset (best-effort)\n"
@@ -982,6 +982,52 @@ def _parse_rate_hz(value: str) -> int:
     raise ValueError(
         "Unsupported rate. Use one of: 0.1 0.5 1 2 5 10 20 50 100 200"
     )
+
+
+def _rate_code_to_hz(code: int) -> Optional[float]:
+    """Map a protocol RATE code to Hz."""
+
+    code_to_hz = {
+        0x01: 0.1,
+        0x02: 0.5,
+        0x03: 1.0,
+        0x04: 2.0,
+        0x05: 5.0,
+        0x06: 10.0,
+        0x07: 20.0,
+        0x08: 50.0,
+        0x09: 100.0,
+        0x0A: 200.0,
+    }
+    return code_to_hz.get(code)
+
+
+async def _read_register_first_u16(
+    client: WitMotionBleClient,
+    start_register: int,
+    wait_s: float,
+) -> int:
+    """Read the first 16-bit value from a register-window response."""
+
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            await client.write_command(build_read_register_command(start_register))
+            measurement = await client.read_until(
+                lambda m: m.start_register == start_register,
+                timeout_s=wait_s,
+            )
+            if len(measurement.raw) < 6:
+                raise RuntimeError("Short register response")
+            # First register value is at bytes 4..5 of the 20-byte 0x71 frame.
+            return _decode_u16(measurement.raw, 4)
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to read register")
 
 
 def _parse_baud(value: str) -> int:
@@ -1088,16 +1134,36 @@ async def _run_repl(
                 continue
 
             if cmd == "rate":
-                if len(cmd_args) != 1:
-                    print("Usage: rate <hz>")
+                if len(cmd_args) == 0:
+                    try:
+                        raw_value = await _read_register_first_u16(
+                            client,
+                            start_register=0x03,
+                            wait_s=wait_s,
+                        )
+                        rate_code = raw_value & 0xFF
+                        hz = _rate_code_to_hz(rate_code)
+                        if hz is None:
+                            print(f"RATE(code)=0x{rate_code:02X}")
+                        else:
+                            print(f"RATE={hz:g}Hz (code=0x{rate_code:02X})")
+                    except Exception as exc:
+                        print(f"Error: {exc}")
                     continue
-                try:
-                    rate_code = _parse_rate_hz(cmd_args[0])
-                    await client.write_command(build_set_rate_command(rate_code))
-                    await client.write_command(build_save_config_command(0))
-                    print(f"Set rate to {cmd_args[0]} Hz (code=0x{rate_code:02X}).")
-                except Exception as exc:
-                    print(f"Error: {exc}")
+
+                if len(cmd_args) == 1:
+                    try:
+                        rate_code = _parse_rate_hz(cmd_args[0])
+                        await client.write_command(build_set_rate_command(rate_code))
+                        await client.write_command(build_save_config_command(0))
+                        print(
+                            f"Set rate to {cmd_args[0]} Hz (code=0x{rate_code:02X})."
+                        )
+                    except Exception as exc:
+                        print(f"Error: {exc}")
+                    continue
+
+                print("Usage: rate [hz]")
                 continue
 
             if cmd == "baud":
