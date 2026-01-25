@@ -201,18 +201,49 @@ def battery_percent_from_raw(raw_value: int) -> Optional[int]:
     return None
 
 
+def _make_bleak_scanner(detection_callback: Callable[[BLEDevice, Any], None]) -> Any:
+    """Create a BleakScanner, preferring active scanning when supported."""
+
+    kwargs: dict[str, Any] = {}
+    try:
+        sig = inspect.signature(BleakScanner)
+        if "scanning_mode" in sig.parameters:
+            kwargs["scanning_mode"] = "active"
+    except Exception:
+        pass
+
+    try:
+        return BleakScanner(detection_callback=detection_callback, **kwargs)
+    except TypeError:
+        return BleakScanner(detection_callback=detection_callback)
+
+
 async def discover_witmotion_devices(
-    timeout: float = 5.0, name_filter: str = "WT901"
+    timeout: float = 5.0,
+    name_filter: str = "WT901",
+    retries: int = 1,
 ) -> List[BLEDevice]:
-    """Scan for nearby WIT MOTION peripherals and return matching BLEDevices."""
+    """Scan for nearby WIT MOTION peripherals and return matching BLEDevices.
 
-    # On Windows/WinRT, the same peripheral may advertise sometimes with a local
-    # name and sometimes without one. Bleak's discover() snapshot may end up
-    # returning the last-seen advertisement, which can have an empty name. If we
-    # filter only on device.name from discover(), matches become intermittent.
-    LOGGER.info("Scanning for WIT MOTION devices (timeout=%.1fs)", timeout)
+    Notes on reliability:
+    - On Windows/WinRT, a peripheral can be seen with a name in one advertisement
+      and without it in another. A single BleakScanner.discover() snapshot can
+      therefore miss devices if you filter solely on the final device.name.
+    - Even when names are stable, a single short scan window can miss devices
+      that are advertising slowly or that the radio doesn't catch in time.
 
-    needle = name_filter.lower()
+    This helper mitigates both issues by collecting detection callbacks over the
+    scan window and optionally repeating scans, merging results by address.
+    """
+
+    needle = (name_filter or "").strip().lower()
+    scan_attempts = max(1, retries)
+    LOGGER.info(
+        "Scanning for WIT MOTION devices (timeout=%.1fs, attempts=%d)",
+        timeout,
+        scan_attempts,
+    )
+
     best_name_by_address: dict[str, str] = {}
     device_by_address: dict[str, BLEDevice] = {}
     matched_addresses: set[str] = set()
@@ -225,36 +256,43 @@ async def discover_witmotion_devices(
             local_name = (getattr(adv_data, "local_name", None) or "").strip()
 
         candidate = local_name or (device.name or "").strip()
-        if candidate:
-            if not best_name_by_address.get(address):
-                best_name_by_address[address] = candidate
-        if needle in candidate.lower():
+        if candidate and not best_name_by_address.get(address):
+            best_name_by_address[address] = candidate
+        if needle and needle in candidate.lower():
+            matched_addresses.add(address)
+        if not needle:
             matched_addresses.add(address)
 
-    scanner: Any
-    try:
-        scanner = BleakScanner()
-        register_cb = getattr(scanner, "register_detection_callback", None)
-        if callable(register_cb):
-            register_cb(_on_detect)
-        else:
-            scanner = BleakScanner(detection_callback=_on_detect)
+    last_total = 0
+    for attempt in range(1, scan_attempts + 1):
+        try:
+            scanner = _make_bleak_scanner(_on_detect)
+            await scanner.start()
+            await asyncio.sleep(timeout)
+            await scanner.stop()
+        except Exception as exc:
+            LOGGER.debug(
+                "Scan attempt %d: falling back to discover() due to error: %s",
+                attempt,
+                exc,
+            )
+            devices = await BleakScanner.discover(timeout=timeout)
+            for device in devices:
+                _on_detect(device, None)
 
-        await scanner.start()
-        await asyncio.sleep(timeout)
-        await scanner.stop()
-    except Exception as exc:
+        total_now = len(device_by_address)
         LOGGER.debug(
-            "Falling back to BleakScanner.discover due to scanner error: %s", exc
+            "Scan attempt %d/%d: saw %d unique device(s)",
+            attempt,
+            scan_attempts,
+            total_now,
         )
-        devices = await BleakScanner.discover(timeout=timeout)
-        for device in devices:
-            device_by_address[device.address] = device
-            candidate = (device.name or "").strip()
-            if candidate and not best_name_by_address.get(device.address):
-                best_name_by_address[device.address] = candidate
-            if needle in candidate.lower():
-                matched_addresses.add(device.address)
+
+        # If we are no longer discovering new devices and we already have at
+        # least one match, stop early.
+        if total_now == last_total and matched_addresses:
+            break
+        last_total = total_now
 
     matches: List[BLEDevice] = []
     for address in matched_addresses:
@@ -962,7 +1000,10 @@ async def _run_cli(argv: Optional[List[str]] = None) -> int:
     except Exception:
         pass
 
-    devices = await discover_witmotion_devices(timeout=args.timeout)
+    devices = await discover_witmotion_devices(
+        timeout=args.timeout,
+        retries=args.retries,
+    )
 
     # No-args behavior: enter interactive mode.
     if argv is not None and len(argv) == 0:
@@ -1264,7 +1305,10 @@ async def _run_repl(
     logging.getLogger().setLevel(log_level)
 
     print(f"Scanning for devices (timeout={scan_timeout:.1f}s)...")
-    devices = await discover_witmotion_devices(timeout=scan_timeout)
+    devices = await discover_witmotion_devices(
+        timeout=scan_timeout,
+        retries=retries,
+    )
     if not devices:
         print("No WIT MOTION devices discovered.")
         return 1
