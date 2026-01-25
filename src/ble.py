@@ -580,7 +580,23 @@ class WitMotionBleClient:
         self._notify_uuid: Optional[str] = None
         self._write_uuid: Optional[str] = None
         self._write_candidates: List[str] = []
-        self._notification_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        # Keep this bounded: in REPL a user may read sporadically while the
+        # sensor streams at 50-200 Hz, which would otherwise accumulate stale
+        # measurements and make reads appear "stuck".
+        self._notification_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+
+    def clear_pending_notifications(self) -> int:
+        """Drop queued notifications and return how many were removed."""
+
+        removed = 0
+        while True:
+            try:
+                self._notification_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                removed += 1
+        return removed
 
     async def __aenter__(self) -> "WitMotionBleClient":
         self._client = BleakClient(self._device)
@@ -666,7 +682,20 @@ class WitMotionBleClient:
             raise RuntimeError("Notify characteristic not resolved")
 
         def _handler(_: int, data: bytearray) -> None:  # pragma: no cover - tiny helper
-            self._notification_queue.put_nowait(bytes(data))
+            payload = bytes(data)
+            try:
+                self._notification_queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Drop the oldest queued item so we keep the newest samples.
+                try:
+                    self._notification_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    self._notification_queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    # Extremely unlikely: ignore if still full.
+                    pass
 
         await self._client.start_notify(self._notify_uuid, _handler)
 
@@ -957,6 +986,8 @@ async def _read_measurement_type(
         return False
 
     if reg is None:
+        # Drop any backlog so we read the freshest sample after this command.
+        client.clear_pending_notifications()
         return await client.read_until(_matches, timeout_s=wait_s)
 
     # Register-based measurements are often returned as a separate 0x71 frame,
@@ -964,6 +995,7 @@ async def _read_measurement_type(
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
+            client.clear_pending_notifications()
             await client.write_command(build_read_register_command(reg))
         except Exception as exc:
             LOGGER.warning(
@@ -1227,6 +1259,7 @@ async def _read_register_window_i16(
     last_error: Exception | None = None
     for _ in range(3):
         try:
+            client.clear_pending_notifications()
             await client.write_command(build_read_register_command(start_register))
             measurement = await client.read_until(
                 lambda m: m.start_register == start_register,
