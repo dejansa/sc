@@ -64,6 +64,7 @@ COLUMNS = {
     "acc": ("AccX(g)", "AccY(g)", "AccZ(g)"),  # accelerometer
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),  # gyroscope (angular speed)
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),  # magnetometer (magnetic field)
+    "q": ("Q0()", "Q1()", "Q2()", "Q3()"),  # quaternion components (sensor orientation)
     "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
     "accn": ("AccNorm(g)",),  # normalized acceleration magnitude
     "asn": ("AsNorm(°/s)",), # normalized angular speed magnitude
@@ -79,6 +80,33 @@ ANGLE_COLORS = {
     "AngleY(°)": "green",
     "AngleZ(°)": "magenta",
 }
+
+
+def has_quaternion_values(rows_by_device: Dict[str, List[Dict[str, str]]]) -> bool:
+    """Return True if the dataset contains any numeric quaternion (Q0..Q3) samples.
+
+    Some input formats (notably `.ride`) do not include quaternion columns at all.
+    In those cases, requesting the `q` group should not crash the CLI.
+    """
+
+    q_columns = COLUMNS["q"]
+    for rows in rows_by_device.values():
+        for row in rows:
+            if not all(col in row for col in q_columns):
+                continue
+            for col in q_columns:
+                value = row.get(col)
+                if value is None:
+                    continue
+                stripped = value.strip()
+                if not stripped or stripped.lower() == "null":
+                    continue
+                try:
+                    float(stripped)
+                except ValueError:
+                    continue
+                return True
+    return False
 
 
 def parse_timestamp(value: str, row_index: int) -> datetime:
@@ -777,6 +805,14 @@ def plot_devices(
 
     has_angd = "angd" in column_groups
     base_groups = [group for group in column_groups if group != "angd"]
+
+    if "q" in base_groups and not has_quaternion_values(rows_by_device):
+        print("no Q values in this file")
+        base_groups = [group for group in base_groups if group != "q"]
+
+    if not base_groups and not has_angd:
+        return
+
     columns_map = {group: COLUMNS[group] for group in base_groups}
     n_devices = len(rows_by_device)
     total_axes = n_devices * len(base_groups) + (1 if has_angd else 0)
@@ -910,6 +946,7 @@ def parse_args() -> argparse.Namespace:
             "acc  - accelerations\n"
             "as   - angular speed (gyroscope)\n"
             "h    - magnetic field (magnetometer)\n"
+            "q    - quaternion components (Q0..Q3)\n"
             "angd - LEFT-RIGHT angle delta\n"
             "accn - acceleration magnitude (norm)\n"
             "asn  - angular speed magnitude (norm)\n"
