@@ -804,6 +804,15 @@ async def _run_cli(argv: Optional[List[str]] = None) -> int:
 
     devices = await discover_witmotion_devices(timeout=args.timeout)
 
+    # No-args behavior: enter interactive mode.
+    if argv is not None and len(argv) == 0:
+        return await _run_repl(
+            scan_timeout=args.timeout,
+            retries=args.retries,
+            wait_s=args.wait,
+            debug=args.debug,
+        )
+
     if args.list:
         if not devices:
             print("No WIT MOTION devices discovered.")
@@ -868,6 +877,114 @@ async def _run_cli(argv: Optional[List[str]] = None) -> int:
             )
 
     return 0
+
+
+async def _async_input(prompt: str) -> str:
+    """Read input without blocking the event loop."""
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, input, prompt)
+
+
+def _print_repl_help() -> None:
+    print(
+        "Commands:\n"
+        "  h, ?, help   Show this help\n"
+        "  exit, quit   Disconnect and exit\n"
+        "\n"
+        "Measurements (same as -m):\n"
+        "  acc          Acceleration\n"
+        "  as           Angular speed (gyro)\n"
+        "  angle        Euler angles\n"
+        "  mag          Magnetometer\n"
+        "  q            Quaternion\n"
+        "  dt           Datetime\n"
+        "  power        Power/battery\n"
+    )
+
+
+async def _prompt_select_device(
+    devices: List[BLEDevice],
+) -> BLEDevice:
+    """Prompt the user to select a device from a list."""
+
+    for idx, device in enumerate(devices):
+        print(_format_device_line(idx, device))
+
+    while True:
+        choice = (await _async_input("Select device index (or 'exit'): ")).strip()
+        if choice.lower() in {"exit", "quit"}:
+            raise SystemExit(0)
+        try:
+            idx = int(choice)
+        except ValueError:
+            print("Please enter a number from the list.")
+            continue
+        if 0 <= idx < len(devices):
+            return devices[idx]
+        print("Index out of range.")
+
+
+async def _run_repl(
+    scan_timeout: float,
+    retries: int,
+    wait_s: float,
+    debug: bool,
+) -> int:
+    """Interactive mode: scan, select device, connect, then command loop."""
+
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.getLogger().setLevel(log_level)
+
+    print(f"Scanning for devices (timeout={scan_timeout:.1f}s)...")
+    devices = await discover_witmotion_devices(timeout=scan_timeout)
+    if not devices:
+        print("No WIT MOTION devices discovered.")
+        return 1
+
+    selected = await _prompt_select_device(devices)
+    print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
+
+    async with WitMotionBleClient(selected) as client:
+        await client.start_notifications()
+        _print_repl_help()
+
+        while True:
+            try:
+                command = (await _async_input("blex> ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nExiting.")
+                return 0
+
+            if not command:
+                continue
+
+            cmd = command.lower()
+            if cmd in {"exit", "quit"}:
+                return 0
+            if cmd in {"help", "?", "h"}:
+                _print_repl_help()
+                continue
+
+            # Aliases
+            if cmd in {"mag", "m"}:
+                cmd = "h"
+            if cmd in {"gyro"}:
+                cmd = "as"
+
+            if cmd not in {"acc", "as", "angle", "h", "q", "dt", "power"}:
+                print("Unknown command. Type 'help' for options.")
+                continue
+
+            # For Windows devices that go quiet, try to re-request by register a
+            # few times (handled inside _read_measurement_type).
+            try:
+                measurement = await _read_measurement_type(client, cmd, wait_s)
+                print(_format_measurement_value(cmd, measurement))
+            except TimeoutError:
+                print(f"Timed out waiting for {cmd}. Try again.")
+            except Exception as exc:
+                print(f"Error: {exc}")
 
 
 def main() -> None:
