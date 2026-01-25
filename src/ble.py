@@ -108,21 +108,21 @@ def parse_sensor_packet(data: bytes) -> WitMotionMeasurement:
 class WitMotionBleClient:
     """Async context manager for talking to a WIT MOTION BLE peripheral."""
 
-    def __init__(self, address: str) -> None:
-        self._address = address
+    def __init__(self, device: BLEDevice | str) -> None:
+        self._device = device
         self._client: Optional[BleakClient] = None
         self._notification_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
     async def __aenter__(self) -> "WitMotionBleClient":
-        self._client = BleakClient(self._address)
+        self._client = BleakClient(self._device)
         await self._client.connect(timeout=10.0)
-        LOGGER.info("Connected to %s", self._address)
+        LOGGER.info("Connected to %s", self._client.address)
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         if self._client and self._client.is_connected:
             await self._client.disconnect()
-            LOGGER.info("Disconnected from %s", self._address)
+            LOGGER.info("Disconnected from %s", self._client.address)
 
     async def write_command(self, payload: bytes, response: bool = False) -> None:
         """Send a raw protocol command to the sensor."""
@@ -172,14 +172,25 @@ async def _run_main() -> None:
         print("No WIT MOTION devices discovered. Make sure the sensor is broadcasting BLE signals.")
         return
 
-    selected = devices[0]
-    print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
-    async with WitMotionBleClient(selected.address) as client:
-        await client.start_notifications()
-        async for idx, measurement in enumerate(client.notification_stream()):
-            print(f"Notification {idx + 1}: {measurement}")
-            if idx >= 2:
-                break
+    # On Windows, connecting by MAC address can be unreliable. Prefer passing the
+    # BLEDevice object that came from discovery, and try each candidate.
+    last_error: Exception | None = None
+    for selected in devices:
+        print(f"Using {selected.name or 'unnamed device'} ({selected.address})")
+        try:
+            async with WitMotionBleClient(selected) as client:
+                await client.start_notifications()
+                async for idx, measurement in enumerate(client.notification_stream()):
+                    print(f"Notification {idx + 1}: {measurement}")
+                    if idx >= 2:
+                        return
+        except Exception as exc:
+            last_error = exc
+            print(f"Failed to connect to {selected.address}: {exc}")
+            continue
+
+    if last_error is not None:
+        raise last_error
 
 
 def main() -> None:
