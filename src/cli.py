@@ -1,11 +1,14 @@
 import argparse
 import csv
+import io
 import math
 import re
+import zipfile
 from collections import defaultdict
+from contextlib import ExitStack
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Literal, Optional, TextIO
 
 from datetime import datetime, timezone
 
@@ -283,40 +286,46 @@ def parse_ride_file(ride_path: Path | str, *, device_label: str) -> List[Dict[st
     if not path.is_file():
         raise FileNotFoundError(f"Input file not found: {path}")
 
-    normalized_rows: List[Dict[str, str]] = []
     with path.open(newline="", encoding="utf-8-sig") as fp:
-        reader = csv.DictReader(fp, delimiter=",")
-        for idx, row in enumerate(reader, start=1):
-            ts_ms = row.get("timestamp_ms")
-            if ts_ms is None:
-                raise KeyError(
-                    "Ride file is missing the required 'timestamp_ms' column"
-                )
-            try:
-                ts = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Cannot parse timestamp_ms {ts_ms!r} at row {idx}"
-                ) from exc
+        return parse_ride_stream(fp, device_label=device_label)
 
-            normalized_rows.append(
-                {
-                    "DeviceName": device_label,
-                    TIME_COLUMN: ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
-                    "AccX(g)": row.get("AccX", ""),
-                    "AccY(g)": row.get("AccY", ""),
-                    "AccZ(g)": row.get("AccZ", ""),
-                    "AsX(°/s)": row.get("AsX", ""),
-                    "AsY(°/s)": row.get("AsY", ""),
-                    "AsZ(°/s)": row.get("AsZ", ""),
-                    "AngleX(°)": row.get("AngX", ""),
-                    "AngleY(°)": row.get("AngY", ""),
-                    "AngleZ(°)": row.get("AngZ", ""),
-                    "HX(uT)": row.get("HX", ""),
-                    "HY(uT)": row.get("HY", ""),
-                    "HZ(uT)": row.get("HZ", ""),
-                }
-            )
+
+def parse_ride_stream(fp: TextIO, *, device_label: str) -> List[Dict[str, str]]:
+    """Parse a file-like stream containing `.ride` CSV content.
+
+    This is used both for regular `.ride` files on disk and `.ride` members
+    extracted from a `.zip` archive.
+    """
+
+    normalized_rows: List[Dict[str, str]] = []
+    reader = csv.DictReader(fp, delimiter=",")
+    for idx, row in enumerate(reader, start=1):
+        ts_ms = row.get("timestamp_ms")
+        if ts_ms is None:
+            raise KeyError("Ride file is missing the required 'timestamp_ms' column")
+        try:
+            ts = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
+        except ValueError as exc:
+            raise ValueError(f"Cannot parse timestamp_ms {ts_ms!r} at row {idx}") from exc
+
+        normalized_rows.append(
+            {
+                "DeviceName": device_label,
+                TIME_COLUMN: ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                "AccX(g)": row.get("AccX", ""),
+                "AccY(g)": row.get("AccY", ""),
+                "AccZ(g)": row.get("AccZ", ""),
+                "AsX(°/s)": row.get("AsX", ""),
+                "AsY(°/s)": row.get("AsY", ""),
+                "AsZ(°/s)": row.get("AsZ", ""),
+                "AngleX(°)": row.get("AngX", ""),
+                "AngleY(°)": row.get("AngY", ""),
+                "AngleZ(°)": row.get("AngZ", ""),
+                "HX(uT)": row.get("HX", ""),
+                "HY(uT)": row.get("HY", ""),
+                "HZ(uT)": row.get("HZ", ""),
+            }
+        )
 
     timestamped: List[tuple[datetime, Dict[str, str]]] = []
     for idx, row in enumerate(normalized_rows, start=1):
@@ -328,6 +337,86 @@ def parse_ride_file(ride_path: Path | str, *, device_label: str) -> List[Dict[st
         timestamped.append((parse_timestamp(time_value, idx), row))
     timestamped.sort(key=lambda pair: pair[0])
     return [row for _, row in timestamped]
+
+
+def parse_ride_zip(zip_path: Path | str) -> Dict[str, List[Dict[str, str]]]:
+    """Parse a `.zip` archive that contains a LEFT/RIGHT `.ride` pair.
+
+    The archive is expected to include two `.ride` files whose basenames match
+    the usual naming convention, such as `*_left.ride` and `*_right.ride`.
+    """
+
+    path = Path(zip_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Input file not found: {path}")
+
+    with zipfile.ZipFile(path) as zf:
+        left_member, right_member = _resolve_ride_pair_members(zf)
+        with ExitStack() as stack:
+            left_raw = stack.enter_context(zf.open(left_member))
+            right_raw = stack.enter_context(zf.open(right_member))
+            left_text = stack.enter_context(
+                io.TextIOWrapper(left_raw, encoding="utf-8-sig", newline="")
+            )
+            right_text = stack.enter_context(
+                io.TextIOWrapper(right_raw, encoding="utf-8-sig", newline="")
+            )
+            return {
+                "LEFT": parse_ride_stream(left_text, device_label="LEFT"),
+                "RIGHT": parse_ride_stream(right_text, device_label="RIGHT"),
+            }
+
+
+def _resolve_ride_pair_members(zf: zipfile.ZipFile) -> tuple[str, str]:
+    """Return (left_member, right_member) for a `.zip` archive."""
+
+    ride_members = [
+        name
+        for name in zf.namelist()
+        if not name.endswith("/") and name.lower().endswith(".ride")
+    ]
+
+    strict_pattern = re.compile(
+        r"^(?P<prefix>.*?)(?P<sep>[_-])(?P<side>left|right)(?P<suffix>\.ride)$",
+        flags=re.IGNORECASE,
+    )
+    grouped: dict[tuple[str, str, str], dict[str, str]] = {}
+    for member in ride_members:
+        basename = PurePosixPath(member).name
+        match = strict_pattern.match(basename)
+        if not match:
+            continue
+        key = (
+            match.group("prefix"),
+            match.group("sep"),
+            match.group("suffix").lower(),
+        )
+        side = match.group("side").lower()
+        grouped.setdefault(key, {})[side] = member
+
+    pairs = [
+        (sides["left"], sides["right"]) for sides in grouped.values() if "left" in sides and "right" in sides
+    ]
+    if len(pairs) == 1:
+        return pairs[0]
+
+    if not pairs:
+        lefts = [m for m in ride_members if "left" in PurePosixPath(m).name.lower()]
+        rights = [m for m in ride_members if "right" in PurePosixPath(m).name.lower()]
+        if len(lefts) == 1 and len(rights) == 1:
+            return lefts[0], rights[0]
+        raise ValueError(
+            "Zip archive must contain a LEFT/RIGHT .ride pair (e.g. '*_left.ride' and '*_right.ride'). "
+            f"Found {len(ride_members)} .ride files."
+        )
+
+    formatted = ", ".join(
+        f"({PurePosixPath(left).name}, {PurePosixPath(right).name})" for left, right in pairs
+    )
+    raise ValueError(
+        "Zip archive contains multiple LEFT/RIGHT .ride pairs; unable to choose one. "
+        f"Pairs: {formatted}"
+    )
 
 
 def _parse_tabular_file(
@@ -1451,7 +1540,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "file",
-        help="Path to the TSV/CSV/.ride file to parse",
+        help="Path to the TSV/CSV/.ride/.zip file to parse",
     )
     parser.add_argument(
         "-g",
@@ -1530,9 +1619,11 @@ def main() -> None:
         rows_by_device = parse_csv_file(input_path)
     elif suffix == ".ride":
         rows_by_device = parse_ride_pair(input_path)
+    elif suffix == ".zip":
+        rows_by_device = parse_ride_zip(input_path)
     else:
         raise ValueError(
-            "Unsupported file extension. Expected one of: .tsv, .csv, .ride. "
+            "Unsupported file extension. Expected one of: .tsv, .csv, .ride, .zip. "
             f"Got: {input_path}"
         )
     # total_rows = sum(len(rows) for rows in rows_by_device.values())
