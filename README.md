@@ -32,7 +32,7 @@ $ pipx upgrade-all
 
 ```bash
 ❯ scx --help
-usage: scx [-h] [-g GROUP] [-v] [-ma MA_WINDOW] file
+usage: scx [-h] [-g GROUP] [-p {mp,pl}] [-v] [-ma MA_WINDOW] [-f] file
 
 Plot SC sensor export (TSV/CSV/.ride) traces by column group
 
@@ -56,9 +56,14 @@ options:
                         mad  - Madgwick filter
                         mah  - Mahony filter
                         ekf  - Extended Kalman Filter
+  -p {mp,pl}, --plot {mp,pl}
+                        Select plotting backend (default: mp)
+                        mp - matplotlib
+                        pl - plotly
   -v, --version         Show the installed package version
   -ma MA_WINDOW, --ma-window MA_WINDOW
                         Simple moving average window size per signal (default: 5)
+  -f, --fft             Plot the FFT of the first group listed in --group
 ```
 
 ### **_example_**

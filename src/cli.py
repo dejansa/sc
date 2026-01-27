@@ -5,7 +5,7 @@ import re
 from collections import defaultdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from datetime import datetime, timezone
 
@@ -33,6 +33,8 @@ TIME_FORMATS = (
 )
 
 PACKAGE_NAME = "sc"
+
+PlotBackend = Literal["mp", "pl"]
 
 
 def _version_from_pyproject() -> Optional[str]:
@@ -853,8 +855,16 @@ def plot_frequency_spectrum(
     group: str,
     *,
     block: bool = True,
+    plot_backend: PlotBackend = "mp",
 ) -> None:
     """Render a frequency-domain view for the first requested column group."""
+
+    if plot_backend == "pl":
+        _plot_frequency_spectrum_plotly(
+            rows_by_device,
+            group,
+        )
+        return
 
     if plt is None:
         raise RuntimeError(
@@ -946,6 +956,117 @@ def plot_frequency_spectrum(
     plt.show(block=block)
 
 
+def _require_plotly() -> tuple[Any, Any]:
+    """Import Plotly lazily so --help works without optional deps."""
+
+    try:
+        import importlib
+
+        go = importlib.import_module("plotly.graph_objects")
+        subplots = importlib.import_module("plotly.subplots")
+        make_subplots = getattr(subplots, "make_subplots")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "plotly is required for Plotly plotting. Install dependencies (e.g. `pip install plotly`)."
+        ) from exc
+    return go, make_subplots
+
+
+def _plot_frequency_spectrum_plotly(
+    rows_by_device: Dict[str, List[Dict[str, str]]],
+    group: str,
+) -> None:
+    """Render a frequency-domain view using Plotly."""
+
+    go, make_subplots = _require_plotly()
+
+    if group not in COLUMNS:
+        raise KeyError(
+            f"Unknown column group {group!r}; valid keys: {', '.join(COLUMNS)}"
+        )
+    if not rows_by_device:
+        raise ValueError("No device data available for FFT plotting")
+
+    columns = COLUMNS[group]
+    columns_map = {group: columns}
+    n_devices = len(rows_by_device)
+
+    alias_map = {
+        device: device_to_sensor_label(device, fallback=f"sensor{idx + 1}")
+        for idx, device in enumerate(rows_by_device)
+    }
+
+    subplot_titles = [f"{alias_map[device]} FFT" for device in rows_by_device]
+    fig = make_subplots(
+        rows=n_devices,
+        cols=1,
+        shared_xaxes=True,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.06,
+    )
+
+    for device_idx, (device, rows) in enumerate(rows_by_device.items(), start=1):
+        timestamps, column_data = collect_group_data(rows, [group], columns_map)
+        alias = alias_map[device]
+
+        try:
+            sample_interval = _estimate_sample_interval(timestamps)
+        except ValueError:
+            fig.add_annotation(
+                x=0.5,
+                y=0.5,
+                xref=f"x{device_idx} domain" if device_idx > 1 else "x domain",
+                yref=f"y{device_idx} domain" if device_idx > 1 else "y domain",
+                text="Insufficient samples for FFT",
+                showarrow=False,
+            )
+            fig.update_yaxes(title_text=alias, row=device_idx, col=1)
+            continue
+
+        plotted = False
+        for column in columns:
+            values = column_data[group][column]
+            if len(values) < 2:
+                continue
+            try:
+                frequencies, magnitudes = _calculate_frequency_spectrum(
+                    values, sample_interval
+                )
+            except ValueError:
+                continue
+            plotted = True
+            fig.add_trace(
+                go.Scatter(
+                    x=frequencies,
+                    y=magnitudes,
+                    mode="lines",
+                    name=column,
+                    showlegend=(device_idx == 1),
+                ),
+                row=device_idx,
+                col=1,
+            )
+
+        fig.update_yaxes(title_text=alias, row=device_idx, col=1)
+        if not plotted:
+            fig.add_annotation(
+                x=0.5,
+                y=0.5,
+                xref=f"x{device_idx} domain" if device_idx > 1 else "x domain",
+                yref=f"y{device_idx} domain" if device_idx > 1 else "y domain",
+                text="No valid signal samples",
+                showarrow=False,
+            )
+
+    fig.update_xaxes(title_text="frequency (Hz)", row=n_devices, col=1)
+    fig.update_layout(
+        height=250 + n_devices * 220,
+        showlegend=True,
+        title_text=f"{group.upper()} FFT",
+    )
+    fig.show()
+
+
 def device_to_sensor_label(device_name: str, *, fallback: str) -> str:
     """Map a DeviceName to a human label (e.g. LEFT/RIGHT).
 
@@ -977,7 +1098,17 @@ def plot_devices(
     *,
     block: bool = True,
     ma_window: int = 5,
+    plot_backend: PlotBackend = "mp",
 ) -> None:
+    if plot_backend == "pl":
+        _plot_devices_plotly(
+            rows_by_device,
+            column_groups,
+            title,
+            ma_window=ma_window,
+        )
+        return
+
     if plt is None or mdates is None:
         raise RuntimeError(
             "matplotlib is required for plotting. Install dependencies (e.g. `pip install matplotlib`)."
@@ -1108,6 +1239,199 @@ def plot_devices(
     plt.show(block=block)
 
 
+def _plot_devices_plotly(
+    rows_by_device: Dict[str, List[Dict[str, str]]],
+    column_groups: List[str],
+    title: str | None,
+    *,
+    ma_window: int,
+) -> None:
+    """Render time-domain traces using Plotly."""
+
+    go, make_subplots = _require_plotly()
+
+    if not column_groups:
+        raise ValueError("At least one column group must be specified for plotting")
+
+    for group in column_groups:
+        if group not in COLUMNS:
+            raise KeyError(
+                f"Unknown column group {group!r}; valid keys: {', '.join(COLUMNS)}"
+            )
+
+    if not rows_by_device:
+        raise ValueError("No device data available for plotting")
+
+    if ma_window < 0:
+        raise ValueError("ma_window must be a positive integer")
+
+    has_angd = "angd" in column_groups
+    base_groups = [group for group in column_groups if group != "angd"]
+
+    if "q" in base_groups and not has_quaternion_values(rows_by_device):
+        print("no Q values in this file")
+        base_groups = [group for group in base_groups if group != "q"]
+
+    if not base_groups and not has_angd:
+        return
+
+    columns_map = {group: COLUMNS[group] for group in base_groups}
+    n_devices = len(rows_by_device)
+    total_axes = n_devices * len(base_groups) + (1 if has_angd else 0)
+
+    alias_map = {
+        device: device_to_sensor_label(device, fallback=f"sensor{idx + 1}")
+        for idx, device in enumerate(rows_by_device)
+    }
+
+    subplot_titles: List[str] = []
+    for device in rows_by_device:
+        for group in base_groups:
+            subplot_titles.append(group.upper())
+    if has_angd:
+        subplot_titles.append("ANGD")
+
+    fig = make_subplots(
+        rows=total_axes,
+        cols=1,
+        shared_xaxes=True,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.03,
+    )
+
+    shown_legend_names: set[str] = set()
+
+    for device_idx, (device, rows) in enumerate(rows_by_device.items()):
+        timestamps, column_data = collect_group_data(rows, base_groups, columns_map)
+        alias = alias_map[device]
+        for group_idx, group in enumerate(base_groups):
+            row_idx = device_idx * len(base_groups) + group_idx + 1
+            fig.update_yaxes(title_text=alias, row=row_idx, col=1)
+            for column in columns_map[group]:
+                column_values = column_data[group][column]
+                plot_color = ANGLE_COLORS.get(column) if group == "ang" else None
+
+                name = column
+                showlegend = name not in shown_legend_names
+                shown_legend_names.add(name)
+                fig.add_trace(
+                    go.Scatter(
+                        x=timestamps,
+                        y=column_values,
+                        mode="lines",
+                        name=name,
+                        showlegend=showlegend,
+                        line={"color": plot_color} if plot_color else None,
+                    ),
+                    row=row_idx,
+                    col=1,
+                )
+
+                if ma_window >= 2 and column_values:
+                    ma_values = compute_moving_average(column_values, ma_window)
+                    ma_name = f"{column} MA ({ma_window})"
+                    showlegend = ma_name not in shown_legend_names
+                    shown_legend_names.add(ma_name)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=timestamps,
+                            y=ma_values,
+                            mode="lines",
+                            name=ma_name,
+                            showlegend=showlegend,
+                            line={
+                                "color": plot_color,
+                                "dash": "dash",
+                                "width": 2,
+                            }
+                            if plot_color
+                            else {"dash": "dash", "width": 2},
+                            opacity=0.85,
+                        ),
+                        row=row_idx,
+                        col=1,
+                    )
+
+    if has_angd:
+        if len(rows_by_device) < 2:
+            raise ValueError("angd requires at least two sensors (LEFT-RIGHT)")
+
+        (device1, rows1), (device2, rows2) = list(rows_by_device.items())[:2]
+        timestamps1, data1 = collect_group_data(
+            rows1, ["angd"], {"angd": COLUMNS["angd"]}
+        )
+        timestamps2, data2 = collect_group_data(
+            rows2, ["angd"], {"angd": COLUMNS["angd"]}
+        )
+
+        angle_cols = COLUMNS["angd"]
+        min_len = min(len(timestamps1), len(timestamps2))
+        if min_len == 0:
+            raise ValueError("angd requires angle samples in both sensors")
+
+        row_idx = total_axes
+        fig.update_yaxes(title_text="Δ angle", row=row_idx, col=1)
+        for column in angle_cols:
+            values1 = data1["angd"][column][:min_len]
+            values2 = data2["angd"][column][:min_len]
+            diff_values = [v1 - v2 for v1, v2 in zip(values1, values2)]
+
+            plot_color = ANGLE_COLORS.get(column)
+
+            if column.startswith("Angle"):
+                label = f"Δ{column.split('(')[0].strip()}"
+            else:
+                label = f"Δ{column}"
+
+            showlegend = label not in shown_legend_names
+            shown_legend_names.add(label)
+            fig.add_trace(
+                go.Scatter(
+                    x=timestamps1[:min_len],
+                    y=diff_values,
+                    mode="lines",
+                    name=label,
+                    showlegend=showlegend,
+                    line={"color": plot_color} if plot_color else None,
+                ),
+                row=row_idx,
+                col=1,
+            )
+
+            if ma_window >= 2 and diff_values:
+                ma_values = compute_moving_average(diff_values, ma_window)
+                ma_label = f"{label} MA ({ma_window})"
+                showlegend = ma_label not in shown_legend_names
+                shown_legend_names.add(ma_label)
+                fig.add_trace(
+                    go.Scatter(
+                        x=timestamps1[:min_len],
+                        y=ma_values,
+                        mode="lines",
+                        name=ma_label,
+                        showlegend=showlegend,
+                        line={
+                            "color": plot_color,
+                            "dash": "dash",
+                            "width": 2,
+                        }
+                        if plot_color
+                        else {"dash": "dash", "width": 2},
+                        opacity=0.85,
+                    ),
+                    row=row_idx,
+                    col=1,
+                )
+
+    fig.update_xaxes(title_text="time", row=total_axes, col=1)
+    fig.update_layout(
+        height=320 + total_axes * 220,
+        showlegend=True,
+        title_text=title or "SC traces",
+    )
+    fig.show()
+
+
 def parse_group_list(value: str) -> List[str]:
     groups = [group.strip().lower() for group in value.split(",") if group.strip()]
     if not groups:
@@ -1153,6 +1477,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-p",
+        "--plot",
+        default="mp",
+        choices=("mp", "pl"),
+        help=(
+            "Select plotting backend (default: %(default)s)\n"
+            "mp - matplotlib\n"
+            "pl - plotly"
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--version",
         action="version",
@@ -1181,7 +1516,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if plt is None:
+    plot_backend: PlotBackend = args.plot
+    if plot_backend == "mp" and plt is None:
         raise RuntimeError(
             "matplotlib is required for plotting. Install dependencies (e.g. `pip install matplotlib`)."
         )
@@ -1208,14 +1544,17 @@ def main() -> None:
             title=f"{'/'.join(group.upper() for group in args.groups)} traces",
             block=False,
             ma_window=args.ma_window,
+            plot_backend=plot_backend,
         )
         if args.fft:
             plot_frequency_spectrum(
                 rows_by_device,
                 args.groups[0],
                 block=False,
+                plot_backend=plot_backend,
             )
-        plt.show()
+        if plot_backend == "mp":
+            plt.show()
 
 
 if __name__ == "__main__":
