@@ -71,11 +71,9 @@ COLUMNS = {
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),  # magnetometer (magnetic field)
     "q": ("Q0()", "Q1()", "Q2()", "Q3()"),  # quaternion components (sensor orientation)
     "edge": ("Edge(°)",),  # edging/roll angle around the boot forward axis (derived)
-    "angd": ("AngleX(°)", "AngleY(°)", "AngleZ(°)"),  # sensor1 - sensor2 angle delta
-    "accn": ("AccNorm(g)",),  # normalized acceleration magnitude
-    "asn": ("AsNorm(°/s)",), # normalized angular speed magnitude
-    "hn": ("HNorm(uT)",),  # normalized magnetic field magnitude
+    "alt": ("Altitude(m)",),  # GNSS altitude (from *gnss.ride inside a .zip)
     "tilt": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # pitch/roll from accelerometer + yaw from magnetometer
+    "sf0": ("Roll(°)",),  # IMU-only complementary filter (acc + gyro) for roll
     "mad": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Madgwick filter
     "mah": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Mahony filter
     "ekf": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # Extended Kalman Filter
@@ -91,26 +89,13 @@ ANGLE_COLORS = {
 def has_quaternion_values(rows_by_device: Dict[str, List[Dict[str, str]]]) -> bool:
     """Return True if the dataset contains any numeric quaternion (Q0..Q3) samples.
 
-    Some input formats (notably `.ride`) do not include quaternion columns at all.
-    In those cases, requesting the `q` group should not crash the CLI.
+    Some input formats do not include quaternion columns at all. In those cases,
+    requesting the `q` group should not crash the CLI.
     """
 
-    q_columns = COLUMNS["q"]
     for rows in rows_by_device.values():
         for row in rows:
-            if not all(col in row for col in q_columns):
-                continue
-            for col in q_columns:
-                value = row.get(col)
-                if value is None:
-                    continue
-                stripped = value.strip()
-                if not stripped or stripped.lower() == "null":
-                    continue
-                try:
-                    float(stripped)
-                except ValueError:
-                    continue
+            if extract_quaternion_wxyz(row) is not None:
                 return True
     return False
 
@@ -118,13 +103,80 @@ def has_quaternion_values(rows_by_device: Dict[str, List[Dict[str, str]]]) -> bo
 def has_quaternion_columns(rows: List[Dict[str, str]]) -> bool:
     """Return True if the per-row dicts expose all Q0..Q3 columns.
 
-    Some file formats (e.g. `.ride`) never include quaternion columns.
+    Some file formats may use different quaternion column naming conventions
+    (e.g. q0..q3, Q0..Q3, qw/qx/qy/qz). Treat them as present when at least one
+    row yields a full quaternion.
     """
 
-    if not rows:
-        return False
-    q_columns = COLUMNS["q"]
-    return all(col in rows[0] for col in q_columns)
+    for row in rows:
+        if extract_quaternion_wxyz(row) is not None:
+            return True
+    return False
+
+
+def extract_quaternion_wxyz(row: Dict[str, str]) -> Optional[tuple[float, float, float, float]]:
+    """Extract a quaternion from a row dict.
+
+    Supports case-insensitive keys and multiple naming conventions:
+      - q0/q1/q2/q3 (or Q0/Q1/Q2/Q3) interpreted as (w, x, y, z)
+      - qw/qx/qy/qz interpreted as (w, x, y, z)
+      - qx/qy/qz/qw interpreted as (x, y, z, w) and reordered
+
+    The plotting code uses canonical column names "Q0()".."Q3()"; this helper
+    allows inputs like `.ride` exports to feed those plots without requiring the
+    file format to match exactly.
+    """
+
+    normalized: Dict[str, str] = {key.strip().lower(): key for key in row}
+
+    def lookup(*candidates: str) -> Optional[str]:
+        for candidate in candidates:
+            key = candidate.strip().lower()
+            original = normalized.get(key)
+            if original is None:
+                continue
+            value = row.get(original)
+            if value is None:
+                continue
+            stripped = value.strip()
+            if not stripped or stripped.lower() == "null":
+                return None
+            return stripped
+        return None
+
+    def parse_component(value: Optional[str]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    # Prefer q0..q3 conventions.
+    w = parse_component(lookup("q0", "q0()"))
+    x = parse_component(lookup("q1", "q1()"))
+    y = parse_component(lookup("q2", "q2()"))
+    z = parse_component(lookup("q3", "q3()"))
+    if w is not None and x is not None and y is not None and z is not None:
+        return (w, x, y, z)
+
+    # Next try qw/qx/qy/qz.
+    w = parse_component(lookup("qw", "q_w"))
+    x = parse_component(lookup("qx", "q_x"))
+    y = parse_component(lookup("qy", "q_y"))
+    z = parse_component(lookup("qz", "q_z"))
+    if w is not None and x is not None and y is not None and z is not None:
+        return (w, x, y, z)
+
+    # Finally, try qx/qy/qz/qw ordering.
+    x = parse_component(lookup("qx", "q_x"))
+    y = parse_component(lookup("qy", "q_y"))
+    z = parse_component(lookup("qz", "q_z"))
+    w = parse_component(lookup("qw", "q_w"))
+    if w is not None and x is not None and y is not None and z is not None:
+        return (w, x, y, z)
+
+    return None
 
 
 def quaternion_to_edge_deg(q: tuple[float, float, float, float]) -> float:
@@ -300,6 +352,16 @@ def parse_ride_stream(fp: TextIO, *, device_label: str) -> List[Dict[str, str]]:
     normalized_rows: List[Dict[str, str]] = []
     reader = csv.DictReader(fp, delimiter=",")
     for idx, row in enumerate(reader, start=1):
+        normalized_keys = {key.strip().lower(): key for key in row}
+
+        def ride_value(*candidates: str) -> str:
+            for candidate in candidates:
+                original = normalized_keys.get(candidate.strip().lower())
+                if original is None:
+                    continue
+                return row.get(original, "")
+            return ""
+
         ts_ms = row.get("timestamp_ms")
         if ts_ms is None:
             raise KeyError("Ride file is missing the required 'timestamp_ms' column")
@@ -308,8 +370,7 @@ def parse_ride_stream(fp: TextIO, *, device_label: str) -> List[Dict[str, str]]:
         except ValueError as exc:
             raise ValueError(f"Cannot parse timestamp_ms {ts_ms!r} at row {idx}") from exc
 
-        normalized_rows.append(
-            {
+        normalized_row = {
                 "DeviceName": device_label,
                 TIME_COLUMN: ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
                 "AccX(g)": row.get("AccX", ""),
@@ -325,7 +386,18 @@ def parse_ride_stream(fp: TextIO, *, device_label: str) -> List[Dict[str, str]]:
                 "HY(uT)": row.get("HY", ""),
                 "HZ(uT)": row.get("HZ", ""),
             }
-        )
+
+        q0 = ride_value("q0", "q0()")
+        q1 = ride_value("q1", "q1()")
+        q2 = ride_value("q2", "q2()")
+        q3 = ride_value("q3", "q3()")
+        if any((q0, q1, q2, q3)):
+            normalized_row["Q0()"] = q0
+            normalized_row["Q1()"] = q1
+            normalized_row["Q2()"] = q2
+            normalized_row["Q3()"] = q3
+
+        normalized_rows.append(normalized_row)
 
     timestamped: List[tuple[datetime, Dict[str, str]]] = []
     for idx, row in enumerate(normalized_rows, start=1):
@@ -365,6 +437,91 @@ def parse_ride_zip(zip_path: Path | str) -> Dict[str, List[Dict[str, str]]]:
                 "LEFT": parse_ride_stream(left_text, device_label="LEFT"),
                 "RIGHT": parse_ride_stream(right_text, device_label="RIGHT"),
             }
+
+
+def parse_gnss_ride_stream(fp: TextIO) -> tuple[List[datetime], List[float]]:
+    """Parse a GNSS `.ride` CSV stream and return timestamps + altitude.
+
+    Expected columns:
+      - timestamp_ms: Unix epoch milliseconds
+      - altitude: altitude in meters
+    """
+
+    timestamps: List[datetime] = []
+    altitudes: List[float] = []
+
+    reader = csv.DictReader(fp, delimiter=",")
+    for idx, row in enumerate(reader, start=1):
+        ts_ms_raw = row.get("timestamp_ms")
+        alt_raw = row.get("altitude")
+        if ts_ms_raw is None or alt_raw is None:
+            continue
+
+        ts_ms = ts_ms_raw.strip()
+        altitude_str = alt_raw.strip()
+        if not ts_ms or not altitude_str:
+            continue
+        if ts_ms.lower() == "null" or altitude_str.lower() == "null":
+            continue
+
+        try:
+            timestamp = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot parse GNSS timestamp_ms {ts_ms_raw!r} at row {idx}"
+            ) from exc
+
+        try:
+            altitude_m = float(altitude_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Cannot parse GNSS altitude {alt_raw!r} at row {idx}"
+            ) from exc
+
+        timestamps.append(timestamp)
+        altitudes.append(altitude_m)
+
+    if timestamps:
+        combined = sorted(zip(timestamps, altitudes), key=lambda pair: pair[0])
+        timestamps = [ts for ts, _ in combined]
+        altitudes = [alt for _, alt in combined]
+    return timestamps, altitudes
+
+
+def parse_gnss_ride_zip(zip_path: Path | str) -> tuple[List[datetime], List[float]]:
+    """Parse a `.zip` archive member matching `*gnss.ride` and return altitude."""
+
+    path = Path(zip_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"Input file not found: {path}")
+
+    with zipfile.ZipFile(path) as zf:
+        member = _resolve_gnss_member(zf)
+        with zf.open(member) as raw:
+            with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as text:
+                return parse_gnss_ride_stream(text)
+
+
+def _resolve_gnss_member(zf: zipfile.ZipFile) -> str:
+    """Return the GNSS ride member name (basename ends with 'gnss.ride')."""
+
+    candidates = [
+        name
+        for name in zf.namelist()
+        if not name.endswith("/")
+        and PurePosixPath(name).name.lower().endswith("gnss.ride")
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ValueError(
+            "Zip archive does not contain a GNSS ride file matching '*gnss.ride'."
+        )
+    formatted = ", ".join(PurePosixPath(name).name for name in candidates)
+    raise ValueError(
+        "Zip archive contains multiple GNSS ride files; unable to choose one. "
+        f"Candidates: {formatted}"
+    )
 
 
 def _resolve_ride_pair_members(zf: zipfile.ZipFile) -> tuple[str, str]:
@@ -459,6 +616,12 @@ def collect_group_data(
     column_groups: List[str],
     columns_map: Dict[str, tuple[str, ...]],
 ) -> tuple[List[datetime], Dict[str, Dict[str, List[float]]]]:
+    """Collect numeric time series for the requested plot groups.
+
+    The `sf0` group performs IMU-only sensor fusion using accelerometer +
+    gyroscope (angular speed). Currently it outputs roll only.
+    """
+
     column_data: Dict[str, Dict[str, List[float]]] = {
         group: {col: [] for col in columns}
         for group, columns in columns_map.items()
@@ -467,39 +630,53 @@ def collect_group_data(
 
     # Lazy init of optional deps so `--help` still works without runtime extras.
     needs_ahrs = any(group in {"mad", "mah", "ekf"} for group in columns_map)
-    needs_edge = "edge" in columns_map
-    edge_uses_quaternion_columns = needs_edge and has_quaternion_columns(rows)
+    needs_dt = any(group in {"mad", "mah", "ekf", "edge", "sf0"} for group in columns_map)
 
-    if needs_ahrs or (needs_edge and not edge_uses_quaternion_columns):
+    np = None
+    q2euler = None
+    EKF = Madgwick = Mahony = None
+
+    ahrs_filters: Dict[str, object] = {}
+    ahrs_q: Dict[str, Any] = {}
+    last_euler_deg: Dict[str, tuple[float, float, float]] = {}
+    last_dt: float = 0.01
+    prev_ts: datetime | None = None
+    edge_filter = None
+    edge_q = None
+
+    # Complementary filter state for IMU-only fusion (`sf0`).
+    sf0_roll_rad = 0.0
+    sf0_initialized = False
+    sf0_alpha = 0.98
+
+    if needs_ahrs:
         try:
-            import numpy as np
-            from ahrs.common.orientation import q2euler
-            from ahrs.filters import EKF, Madgwick, Mahony
+            import numpy as np  # type: ignore[no-redef]
+            from ahrs.common.orientation import q2euler  # type: ignore[no-redef]
+            from ahrs.filters import EKF, Madgwick, Mahony  # type: ignore[no-redef]
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "Missing optional dependency for 'mad'/'mah'/'ekf'/'edge' groups. "
+                "Missing optional dependency for 'mad'/'mah'/'ekf' groups. "
                 "Install with `pip install ahrs`."
             ) from exc
 
-        ahrs_filters: Dict[str, object] = {
+        ahrs_filters = {
             "mad": Madgwick(),
             "mah": Mahony(),
             "ekf": EKF(),
         }
-        ahrs_q: Dict[str, "np.ndarray"] = {
+        ahrs_q = {
             "mad": np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
             "mah": np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
             "ekf": np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
         }
-        last_euler_deg: Dict[str, tuple[float, float, float]] = {
+        last_euler_deg = {
             "mad": (0.0, 0.0, 0.0),
             "mah": (0.0, 0.0, 0.0),
             "ekf": (0.0, 0.0, 0.0),
         }
-        last_dt: float = 0.01
-        prev_ts: datetime | None = None
         edge_filter = Madgwick()
-        edge_q: "np.ndarray" = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        edge_q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
     for idx, row in enumerate(rows, start=1):
         time_value = row.get(TIME_COLUMN)
         if time_value is None:
@@ -509,7 +686,7 @@ def collect_group_data(
         ts = parse_timestamp(time_value, idx)
         timestamps.append(ts)
 
-        if needs_ahrs:
+        if needs_dt:
             if prev_ts is not None:
                 dt_candidate = (ts - prev_ts).total_seconds()
                 if dt_candidate > 0.0:
@@ -517,32 +694,53 @@ def collect_group_data(
             prev_ts = ts
 
         for group, columns in columns_map.items():
+            if group == "q":
+                quat = extract_quaternion_wxyz(row)
+                if quat is None:
+                    if column_data[group]["Q0()"]:
+                        last_q0 = column_data[group]["Q0()"][-1]
+                        last_q1 = column_data[group]["Q1()"][-1]
+                        last_q2 = column_data[group]["Q2()"][-1]
+                        last_q3 = column_data[group]["Q3()"][-1]
+                        quat = (last_q0, last_q1, last_q2, last_q3)
+                    else:
+                        quat = (0.0, 0.0, 0.0, 0.0)
+                q0, q1, q2, q3 = quat
+                column_data[group]["Q0()"].append(q0)
+                column_data[group]["Q1()"].append(q1)
+                column_data[group]["Q2()"].append(q2)
+                column_data[group]["Q3()"].append(q3)
+                continue
             if group == "edge":
-                if edge_uses_quaternion_columns:
-                    q0 = row.get("Q0()")
-                    q1 = row.get("Q1()")
-                    q2 = row.get("Q2()")
-                    q3 = row.get("Q3()")
-                    if q0 is None or q1 is None or q2 is None or q3 is None:
-                        raise KeyError(
-                            "CSV is missing one of the required quaternion columns: 'Q0()', 'Q1()', 'Q2()', 'Q3()'"
-                        )
-                    try:
-                        qw = float(q0)
-                        qx = float(q1)
-                        qy = float(q2)
-                        qz = float(q3)
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"Non-numeric entry in quaternion columns at row {idx}"
-                        ) from exc
+                quat = extract_quaternion_wxyz(row)
+                if quat is not None:
+                    qw, qx, qy, qz = quat
                     column_data[group]["Edge(°)"].append(
                         quaternion_to_edge_deg((qw, qx, qy, qz))
                     )
                     continue
 
-                # No quaternions in the input: estimate them from acc+gyro (IMU)
-                # and then compute the edging/roll angle from gravity.
+                if column_data[group]["Edge(°)"]:
+                    column_data[group]["Edge(°)"].append(
+                        column_data[group]["Edge(°)"][-1]
+                    )
+                    continue
+
+                # No quaternions in the input (or first samples are missing):
+                # estimate them from acc+gyro (IMU) and then compute the
+                # edging/roll angle from gravity.
+                if edge_filter is None or edge_q is None:
+                    try:
+                        import numpy as np
+                        from ahrs.filters import Madgwick
+                    except ModuleNotFoundError as exc:
+                        raise RuntimeError(
+                            "Missing optional dependency for 'edge' group when quaternions are not available. "
+                            "Install with `pip install ahrs`."
+                        ) from exc
+                    edge_filter = Madgwick()
+                    edge_q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
                 ax_val = row.get("AccX(g)")
                 ay_val = row.get("AccY(g)")
                 az_val = row.get("AccZ(g)")
@@ -652,6 +850,61 @@ def collect_group_data(
                     quaternion_to_edge_deg((qw, qx, qy, qz))
                 )
                 continue
+            if group == "sf0":
+                ax_val = row.get("AccX(g)")
+                ay_val = row.get("AccY(g)")
+                az_val = row.get("AccZ(g)")
+                gx_val = row.get("AsX(°/s)")
+                gy_val = row.get("AsY(°/s)")
+                gz_val = row.get("AsZ(°/s)")
+                if (
+                    ax_val is None
+                    or ay_val is None
+                    or az_val is None
+                    or gx_val is None
+                    or gy_val is None
+                    or gz_val is None
+                ):
+                    raise KeyError(
+                        "CSV is missing one of the required IMU columns for 'sf0': "
+                        "'AccX(g)', 'AccY(g)', 'AccZ(g)', 'AsX(°/s)', 'AsY(°/s)', 'AsZ(°/s)'"
+                    )
+                try:
+                    ax = float(ax_val)
+                    ay = float(ay_val)
+                    az = float(az_val)
+                    gx = float(gx_val)
+                    gy = float(gy_val)
+                    gz = float(gz_val)
+                except ValueError as exc:
+                    raise ValueError(f"Non-numeric entry in IMU columns at row {idx}") from exc
+
+                # Some logs have duplicate timestamps. Reuse the last observed dt.
+                dt = last_dt if last_dt > 0.0 else 0.01
+
+                # Roll observation from gravity (accelerometer direction).
+                # This formula assumes the sensor's axes follow the same
+                # convention as used elsewhere in this file.
+                acc_norm = math.sqrt(ax * ax + ay * ay + az * az)
+                if acc_norm > 0.0:
+                    roll_acc = math.atan2(ay, az)
+                else:
+                    roll_acc = sf0_roll_rad
+
+                # Initialize using accelerometer so the first value isn't arbitrary.
+                if not sf0_initialized:
+                    sf0_roll_rad = roll_acc
+                    sf0_initialized = True
+                else:
+                    # Gyro propagation (deg/s -> rad/s).
+                    sf0_roll_rad += math.radians(gx) * dt
+
+                    # Complementary correction using accelerometer.
+                    if acc_norm > 0.0:
+                        sf0_roll_rad = sf0_alpha * sf0_roll_rad + (1.0 - sf0_alpha) * roll_acc
+
+                column_data[group]["Roll(°)"].append(math.degrees(sf0_roll_rad))
+                continue
             if group in {"mad", "mah", "ekf"}:
                 ax_val = row.get("AccX(g)")
                 ay_val = row.get("AccY(g)")
@@ -752,64 +1005,6 @@ def collect_group_data(
                 column_data[group]["Pitch(°)"].append(pitch_deg)
                 column_data[group]["Roll(°)"].append(roll_deg)
                 column_data[group]["Yaw(°)"].append(yaw_deg)
-                continue
-            if group == "hn":
-                hx = row.get("HX(uT)")
-                hy = row.get("HY(uT)")
-                hz = row.get("HZ(uT)")
-                if hx is None or hy is None or hz is None:
-                    raise KeyError(
-                        "CSV is missing one of the required magnetometer columns: 'HX(uT)', 'HY(uT)', 'HZ(uT)'"
-                    )
-                try:
-                    bx = float(hx)
-                    by = float(hy)
-                    bz = float(hz)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Non-numeric entry in magnetometer columns at row {idx}"
-                    ) from exc
-
-                bmag = math.sqrt(bx * bx + by * by + bz * bz)
-                column_data[group]["HNorm(uT)"].append(bmag)
-                continue
-            if group == "accn":
-                ax_val = row.get("AccX(g)")
-                ay_val = row.get("AccY(g)")
-                az_val = row.get("AccZ(g)")
-                if ax_val is None or ay_val is None or az_val is None:
-                    raise KeyError(
-                        "CSV is missing one of the required accelerometer columns: 'AccX(g)', 'AccY(g)', 'AccZ(g)'"
-                    )
-                try:
-                    ax = float(ax_val)
-                    ay = float(ay_val)
-                    az = float(az_val)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Non-numeric entry in accelerometer columns at row {idx}"
-                    ) from exc
-                amag = math.sqrt(ax * ax + ay * ay + az * az)
-                column_data[group]["AccNorm(g)"].append(amag)
-                continue
-            if group == "asn":
-                gx_val = row.get("AsX(°/s)")
-                gy_val = row.get("AsY(°/s)")
-                gz_val = row.get("AsZ(°/s)")
-                if gx_val is None or gy_val is None or gz_val is None:
-                    raise KeyError(
-                        "CSV is missing one of the required gyroscope columns: 'AsX(°/s)', 'AsY(°/s)', 'AsZ(°/s)'"
-                    )
-                try:
-                    gx = float(gx_val)
-                    gy = float(gy_val)
-                    gz = float(gz_val)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Non-numeric entry in gyroscope columns at row {idx}"
-                    ) from exc
-                gmag = math.sqrt(gx * gx + gy * gy + gz * gz)
-                column_data[group]["AsNorm(°/s)"].append(gmag)
                 continue
             if group == "tilt":
                 ax_val = row.get("AccX(g)")
@@ -1156,6 +1351,58 @@ def _plot_frequency_spectrum_plotly(
     fig.show()
 
 
+def plot_altitude(
+    timestamps: List[datetime],
+    altitudes: List[float],
+    *,
+    block: bool = True,
+    plot_backend: PlotBackend = "mp",
+) -> None:
+    """Plot GNSS altitude vs time."""
+
+    if not timestamps:
+        raise ValueError("No GNSS altitude samples found")
+    if len(timestamps) != len(altitudes):
+        raise ValueError("GNSS timestamps and altitudes must have the same length")
+
+    if plot_backend == "pl":
+        go, _ = _require_plotly()
+        fig = go.Figure(
+            data=[
+                go.Scatter(
+                    x=timestamps,
+                    y=altitudes,
+                    mode="lines",
+                    name="altitude",
+                )
+            ]
+        )
+        fig.update_layout(
+            title_text="ALT (GNSS)",
+            xaxis_title="time",
+            yaxis_title="altitude (m)",
+            height=520,
+        )
+        fig.show()
+        return
+
+    if plt is None or mdates is None:
+        raise RuntimeError(
+            "matplotlib is required for plotting. Install dependencies (e.g. `pip install matplotlib`)."
+        )
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+    ax.plot(timestamps, altitudes, label="altitude")
+    ax.set_title("ALT (GNSS)")
+    ax.set_xlabel("time")
+    ax.set_ylabel("altitude (m)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+    ax.grid(True)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    plt.show(block=block)
+
+
 def device_to_sensor_label(device_name: str, *, fallback: str) -> str:
     """Map a DeviceName to a human label (e.g. LEFT/RIGHT).
 
@@ -1217,19 +1464,18 @@ def plot_devices(
     if ma_window < 0:
         raise ValueError("ma_window must be a positive integer")
 
-    has_angd = "angd" in column_groups
-    base_groups = [group for group in column_groups if group != "angd"]
+    base_groups = column_groups
 
     if "q" in base_groups and not has_quaternion_values(rows_by_device):
         print("no Q values in this file")
         base_groups = [group for group in base_groups if group != "q"]
 
-    if not base_groups and not has_angd:
+    if not base_groups:
         return
 
     columns_map = {group: COLUMNS[group] for group in base_groups}
     n_devices = len(rows_by_device)
-    total_axes = n_devices * len(base_groups) + (1 if has_angd else 0)
+    total_axes = n_devices * len(base_groups)
     fig, axes = plt.subplots(
         total_axes,
         1,
@@ -1252,7 +1498,7 @@ def plot_devices(
                 column_values = column_data[group][column]
                 plot_color = ANGLE_COLORS.get(column) if group == "ang" else None
                 ax.plot(timestamps, column_values, label=column, color=plot_color)
-                if ma_window >= 2 and column_values:
+                if group != "sf0" and ma_window >= 2 and column_values:
                     ma_values = compute_moving_average(column_values, ma_window)
                     ax.plot(
                         timestamps,
@@ -1268,49 +1514,6 @@ def plot_devices(
             ax.set_ylabel(alias)
             ax.grid(True)
             ax.legend(loc="upper right")
-
-    if has_angd:
-        if len(rows_by_device) < 2:
-            raise ValueError("angd requires at least two sensors (LEFT-RIGHT)")
-
-        (device1, rows1), (device2, rows2) = list(rows_by_device.items())[:2]
-        timestamps1, data1 = collect_group_data(rows1, ["angd"], {"angd": COLUMNS["angd"]})
-        timestamps2, data2 = collect_group_data(rows2, ["angd"], {"angd": COLUMNS["angd"]})
-
-        angle_cols = COLUMNS["angd"]
-        min_len = min(len(timestamps1), len(timestamps2))
-        if min_len == 0:
-            raise ValueError("angd requires angle samples in both sensors")
-
-        ax = axes_list[-1]
-        for column in angle_cols:
-            values1 = data1["angd"][column][:min_len]
-            values2 = data2["angd"][column][:min_len]
-            diff_values = [v1 - v2 for v1, v2 in zip(values1, values2)]
-
-            plot_color = ANGLE_COLORS.get(column)
-
-            if column.startswith("Angle"):
-                label = f"Δ{column.split('(')[0].strip()}"
-            else:
-                label = f"Δ{column}"
-            ax.plot(timestamps1[:min_len], diff_values, label=label, color=plot_color)
-            if ma_window >= 2 and diff_values:
-                ma_values = compute_moving_average(diff_values, ma_window)
-                ax.plot(
-                    timestamps1[:min_len],
-                    ma_values,
-                    label=f"{label} MA ({ma_window})",
-                    color=plot_color,
-                    linestyle="--",
-                    linewidth=1.25,
-                    alpha=0.85,
-                )
-
-        ax.set_title("ANGD")
-        ax.set_ylabel("Δ angle")
-        ax.grid(True)
-        ax.legend(loc="upper right")
 
     axes_list[-1].set_xlabel("time")
     axes_list[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
@@ -1354,19 +1557,18 @@ def _plot_devices_plotly(
     if ma_window < 0:
         raise ValueError("ma_window must be a positive integer")
 
-    has_angd = "angd" in column_groups
-    base_groups = [group for group in column_groups if group != "angd"]
+    base_groups = column_groups
 
     if "q" in base_groups and not has_quaternion_values(rows_by_device):
         print("no Q values in this file")
         base_groups = [group for group in base_groups if group != "q"]
 
-    if not base_groups and not has_angd:
+    if not base_groups:
         return
 
     columns_map = {group: COLUMNS[group] for group in base_groups}
     n_devices = len(rows_by_device)
-    total_axes = n_devices * len(base_groups) + (1 if has_angd else 0)
+    total_axes = n_devices * len(base_groups)
 
     alias_map = {
         device: device_to_sensor_label(device, fallback=f"sensor{idx + 1}")
@@ -1377,8 +1579,6 @@ def _plot_devices_plotly(
     for device in rows_by_device:
         for group in base_groups:
             subplot_titles.append(group.upper())
-    if has_angd:
-        subplot_titles.append("ANGD")
 
     fig = make_subplots(
         rows=total_axes,
@@ -1416,7 +1616,7 @@ def _plot_devices_plotly(
                     col=1,
                 )
 
-                if ma_window >= 2 and column_values:
+                if group != "sf0" and ma_window >= 2 and column_values:
                     ma_values = compute_moving_average(column_values, ma_window)
                     ma_name = f"{column} MA ({ma_window})"
                     showlegend = ma_name not in shown_legend_names
@@ -1440,77 +1640,6 @@ def _plot_devices_plotly(
                         row=row_idx,
                         col=1,
                     )
-
-    if has_angd:
-        if len(rows_by_device) < 2:
-            raise ValueError("angd requires at least two sensors (LEFT-RIGHT)")
-
-        (device1, rows1), (device2, rows2) = list(rows_by_device.items())[:2]
-        timestamps1, data1 = collect_group_data(
-            rows1, ["angd"], {"angd": COLUMNS["angd"]}
-        )
-        timestamps2, data2 = collect_group_data(
-            rows2, ["angd"], {"angd": COLUMNS["angd"]}
-        )
-
-        angle_cols = COLUMNS["angd"]
-        min_len = min(len(timestamps1), len(timestamps2))
-        if min_len == 0:
-            raise ValueError("angd requires angle samples in both sensors")
-
-        row_idx = total_axes
-        fig.update_yaxes(title_text="Δ angle", row=row_idx, col=1)
-        for column in angle_cols:
-            values1 = data1["angd"][column][:min_len]
-            values2 = data2["angd"][column][:min_len]
-            diff_values = [v1 - v2 for v1, v2 in zip(values1, values2)]
-
-            plot_color = ANGLE_COLORS.get(column)
-
-            if column.startswith("Angle"):
-                label = f"Δ{column.split('(')[0].strip()}"
-            else:
-                label = f"Δ{column}"
-
-            showlegend = label not in shown_legend_names
-            shown_legend_names.add(label)
-            fig.add_trace(
-                go.Scatter(
-                    x=timestamps1[:min_len],
-                    y=diff_values,
-                    mode="lines",
-                    name=label,
-                    showlegend=showlegend,
-                    line={"color": plot_color} if plot_color else None,
-                ),
-                row=row_idx,
-                col=1,
-            )
-
-            if ma_window >= 2 and diff_values:
-                ma_values = compute_moving_average(diff_values, ma_window)
-                ma_label = f"{label} MA ({ma_window})"
-                showlegend = ma_label not in shown_legend_names
-                shown_legend_names.add(ma_label)
-                fig.add_trace(
-                    go.Scatter(
-                        x=timestamps1[:min_len],
-                        y=ma_values,
-                        mode="lines",
-                        name=ma_label,
-                        showlegend=showlegend,
-                        line={
-                            "color": plot_color,
-                            "dash": "dash",
-                            "width": 2,
-                        }
-                        if plot_color
-                        else {"dash": "dash", "width": 2},
-                        opacity=0.85,
-                    ),
-                    row=row_idx,
-                    col=1,
-                )
 
     fig.update_xaxes(title_text="time", row=total_axes, col=1)
     fig.update_layout(
@@ -1555,11 +1684,9 @@ def parse_args() -> argparse.Namespace:
             "h    - magnetic field (magnetometer)\n"
             "q    - quaternion components (Q0..Q3)\n"
             "edge - edging angle around boot forward axis\n"
-            "angd - LEFT-RIGHT angle delta\n"
-            "accn - acceleration magnitude (norm)\n"
-            "asn  - angular speed magnitude (norm)\n"
-            "hn   - magnetic field magnitude (norm)\n"
+            "alt  - GNSS altitude from *gnss.ride in a .zip\n"
             "tilt - pitch/roll from accelerometer + yaw heading\n"
+            "sf0  - IMU-only roll fusion (acc + gyro)\n"
             "mad  - Madgwick filter\n"
             "mah  - Mahony filter\n"
             "ekf  - Extended Kalman Filter"
@@ -1611,9 +1738,31 @@ def main() -> None:
             "matplotlib is required for plotting. Install dependencies (e.g. `pip install matplotlib`)."
         )
 
+    did_plot = False
+
     input_path = Path(args.file).expanduser()
     suffix = input_path.suffix.lower()
-    if suffix == ".tsv":
+    groups: List[str] = list(args.groups)
+    if "alt" in groups:
+        if suffix != ".zip":
+            raise ValueError("alt group is only supported for .zip inputs")
+        try:
+            gnss_timestamps, gnss_altitudes = parse_gnss_ride_zip(input_path)
+        except ValueError:
+            print("gnss data not found in this zip")
+        else:
+            plot_altitude(
+                gnss_timestamps,
+                gnss_altitudes,
+                block=False,
+                plot_backend=plot_backend,
+            )
+            did_plot = True
+        groups = [group for group in groups if group != "alt"]
+
+    if not groups:
+        rows_by_device: Dict[str, List[Dict[str, str]]] = {}
+    elif suffix == ".tsv":
         rows_by_device = parse_tsv_file(input_path)
     elif suffix == ".csv":
         rows_by_device = parse_csv_file(input_path)
@@ -1631,21 +1780,23 @@ def main() -> None:
     if rows_by_device:
         plot_devices(
             rows_by_device,
-            column_groups=args.groups,
-            title=f"{'/'.join(group.upper() for group in args.groups)} traces",
+            column_groups=groups,
+            title=f"{'/'.join(group.upper() for group in groups)} traces",
             block=False,
             ma_window=args.ma_window,
             plot_backend=plot_backend,
         )
+        did_plot = True
         if args.fft:
             plot_frequency_spectrum(
                 rows_by_device,
-                args.groups[0],
+                groups[0],
                 block=False,
                 plot_backend=plot_backend,
             )
-        if plot_backend == "mp":
-            plt.show()
+
+    if plot_backend == "mp" and did_plot:
+        plt.show()
 
 
 if __name__ == "__main__":
