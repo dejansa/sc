@@ -1182,17 +1182,20 @@ def _calculate_frequency_spectrum(values: List[float], sample_interval: float) -
     return frequencies.tolist(), magnitudes.tolist()
 
 
-def apply_chebyshev_bandpass(
+def apply_iir_bandpass(
     values: List[float],
     sample_interval: float,
+    filter_type: str,
     low_hz: float,
     high_hz: float,
 ) -> List[float]:
-    """Return zero-phase Chebyshev type I band-pass filtered samples.
+    """Return zero-phase IIR band-pass filtered samples using filtfilt.
 
-    Uses a 4th-order filter with 0.5 dB passband ripple and filtfilt for
-    zero-phase response. Raises when inputs are invalid or the dataset is too
-    short relative to the filter length.
+    Supports filter_type:
+      - b  : Butterworth
+      - c1 : Chebyshev type I (0.5 dB ripple)
+      - c2 : Chebyshev type II (40 dB stopband attenuation)
+      - e  : Elliptic (0.5 dB ripple, 40 dB stopband attenuation)
     """
 
     if sample_interval <= 0.0:
@@ -1216,7 +1219,17 @@ def apply_chebyshev_bandpass(
         ) from exc
 
     wn = [low_hz / nyquist, high_hz / nyquist]
-    b, a = signal.cheby1(4, 0.5, wn, btype="bandpass")
+    if filter_type == "b":
+        b, a = signal.butter(4, wn, btype="bandpass")
+    elif filter_type == "c1":
+        b, a = signal.cheby1(4, 0.5, wn, btype="bandpass")
+    elif filter_type == "c2":
+        b, a = signal.cheby2(4, 40.0, wn, btype="bandpass")
+    elif filter_type == "e":
+        b, a = signal.ellip(4, 0.5, 40.0, wn, btype="bandpass")
+    else:
+        raise ValueError(f"Unsupported band-pass filter type: {filter_type}")
+
     min_len = max(len(a), len(b)) * 3
     if len(values) < min_len:
         raise ValueError(
@@ -1528,7 +1541,7 @@ def plot_devices(
     block: bool = True,
     ma_window: int = 5,
     plot_backend: PlotBackend = "mp",
-    bandpass: tuple[float, float] | None = None,
+    bandpass: tuple[str, float, float] | None = None,
 ) -> None:
     if plot_backend == "pl":
         _plot_devices_plotly(
@@ -1622,13 +1635,14 @@ def plot_devices(
             edge_values = column_data[edge_group]["Edge(°)"]
             try:
                 sample_interval = _estimate_sample_interval(timestamps)
-                filtered_edge = apply_chebyshev_bandpass(
-                    edge_values, sample_interval, bandpass[0], bandpass[1]
+                filtered_edge = apply_iir_bandpass(
+                    edge_values, sample_interval, bandpass[0], bandpass[1], bandpass[2]
                 )
+                filt_label = bandpass[0].upper()
                 ax.plot(
                     timestamps,
                     filtered_edge,
-                    label=f"Edge BP {bandpass[0]}-{bandpass[1]} Hz",
+                    label=f"Edge BP {filt_label} {bandpass[1]}-{bandpass[2]} Hz",
                     color="orange",
                 )
                 ax.legend(loc="upper right")
@@ -1667,7 +1681,7 @@ def _plot_devices_plotly(
     title: str | None,
     *,
     ma_window: int,
-    bandpass: tuple[float, float] | None,
+    bandpass: tuple[str, float, float] | None,
 ) -> None:
     """Render time-domain traces using Plotly."""
 
@@ -1786,10 +1800,11 @@ def _plot_devices_plotly(
                 edge_values = column_data[edge_group]["Edge(°)"]
                 try:
                     sample_interval = _estimate_sample_interval(timestamps)
-                    filtered_edge = apply_chebyshev_bandpass(
-                        edge_values, sample_interval, bandpass[0], bandpass[1]
+                    filtered_edge = apply_iir_bandpass(
+                        edge_values, sample_interval, bandpass[0], bandpass[1], bandpass[2]
                     )
-                    name = f"Edge BP {bandpass[0]}-{bandpass[1]} Hz"
+                    filt_label = bandpass[0].upper()
+                    name = f"Edge BP {filt_label} {bandpass[1]}-{bandpass[2]} Hz"
                     showlegend = name not in shown_legend_names
                     shown_legend_names.add(name)
                     fig.add_trace(
@@ -1835,15 +1850,23 @@ def parse_group_list(value: str) -> List[str]:
     return groups
 
 
-def parse_bandpass(value: str) -> tuple[float, float]:
+def parse_bandpass(value: str) -> tuple[str, float, float]:
     parts = value.split("|")
-    if len(parts) != 2:
+    if len(parts) != 3:
         raise argparse.ArgumentTypeError(
-            "band-pass must be formatted as '<low>|<high>' (Hz)"
+            "band-pass must be formatted as '<type>|<low>|<high>' (Hz)"
         )
+
+    filter_type = parts[0].strip().lower()
+    if filter_type not in {"b", "c1", "c2", "e"}:
+        raise argparse.ArgumentTypeError(
+            "band-pass type must be one of: b (Butterworth), c1 (Chebyshev I), "
+            "c2 (Chebyshev II), e (Elliptic)"
+        )
+
     try:
-        low = float(parts[0])
-        high = float(parts[1])
+        low = float(parts[1])
+        high = float(parts[2])
     except ValueError as exc:
         raise argparse.ArgumentTypeError("band-pass cutoffs must be numbers") from exc
 
@@ -1851,7 +1874,7 @@ def parse_bandpass(value: str) -> tuple[float, float]:
         raise argparse.ArgumentTypeError("band-pass cutoffs must be positive")
     if low >= high:
         raise argparse.ArgumentTypeError("band-pass low cutoff must be < high cutoff")
-    return low, high
+    return filter_type, low, high
 
 
 def parse_args() -> argparse.Namespace:
@@ -1890,9 +1913,10 @@ def parse_args() -> argparse.Namespace:
         "--bandpass",
         type=parse_bandpass,
         help=(
-            "Apply Chebyshev band-pass filter to edge traces and plot the "
-            "filtered result as an extra subplot. Format: <low>|<high> (Hz). "
-            "Ignored unless 'edge' or 'edge2' is requested."
+            "Apply IIR band-pass filter to edge traces and plot the filtered "
+            "result as an extra subplot. Format: <type>|<low>|<high> (Hz). "
+            "Types: b (Butterworth), c1 (Chebyshev I), c2 (Chebyshev II), "
+            "e (Elliptic). Ignored unless 'edge' or 'edge2' is requested."
         ),
     )
     parser.add_argument(
