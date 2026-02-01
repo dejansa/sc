@@ -1182,6 +1182,51 @@ def _calculate_frequency_spectrum(values: List[float], sample_interval: float) -
     return frequencies.tolist(), magnitudes.tolist()
 
 
+def apply_chebyshev_bandpass(
+    values: List[float],
+    sample_interval: float,
+    low_hz: float,
+    high_hz: float,
+) -> List[float]:
+    """Return zero-phase Chebyshev type I band-pass filtered samples.
+
+    Uses a 4th-order filter with 0.5 dB passband ripple and filtfilt for
+    zero-phase response. Raises when inputs are invalid or the dataset is too
+    short relative to the filter length.
+    """
+
+    if sample_interval <= 0.0:
+        raise ValueError("Sample interval must be positive for band-pass filtering")
+    if low_hz <= 0.0 or high_hz <= 0.0:
+        raise ValueError("Band-pass cutoffs must be positive")
+    if low_hz >= high_hz:
+        raise ValueError("Band-pass low cutoff must be < high cutoff")
+
+    nyquist = 0.5 / sample_interval
+    if high_hz >= nyquist:
+        raise ValueError(
+            f"Band-pass high cutoff must be below Nyquist ({nyquist:.3f} Hz)"
+        )
+
+    try:
+        from scipy import signal
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "scipy is required for band-pass filtering. Install with `pip install scipy`."
+        ) from exc
+
+    wn = [low_hz / nyquist, high_hz / nyquist]
+    b, a = signal.cheby1(4, 0.5, wn, btype="bandpass")
+    min_len = max(len(a), len(b)) * 3
+    if len(values) < min_len:
+        raise ValueError(
+            f"Not enough samples for band-pass filtering (need >= {min_len})"
+        )
+
+    filtered = signal.filtfilt(b, a, values)
+    return filtered.tolist()
+
+
 def plot_frequency_spectrum(
     rows_by_device: Dict[str, List[Dict[str, str]]],
     group: str,
@@ -1483,6 +1528,7 @@ def plot_devices(
     block: bool = True,
     ma_window: int = 5,
     plot_backend: PlotBackend = "mp",
+    bandpass: tuple[float, float] | None = None,
 ) -> None:
     if plot_backend == "pl":
         _plot_devices_plotly(
@@ -1490,6 +1536,7 @@ def plot_devices(
             column_groups,
             title,
             ma_window=ma_window,
+            bandpass=bandpass,
         )
         return
 
@@ -1523,7 +1570,12 @@ def plot_devices(
 
     columns_map = {group: COLUMNS[group] for group in base_groups}
     n_devices = len(rows_by_device)
-    total_axes = n_devices * len(base_groups)
+
+    apply_bandpass = bandpass is not None and any(
+        group in base_groups for group in {"edge", "edge2"}
+    )
+    axes_per_device = len(base_groups) + (1 if apply_bandpass else 0)
+    total_axes = n_devices * axes_per_device
     fig, axes = plt.subplots(
         total_axes,
         1,
@@ -1540,7 +1592,7 @@ def plot_devices(
     for device_idx, (device, rows) in enumerate(rows_by_device.items()):
         timestamps, column_data = collect_group_data(rows, base_groups, columns_map)
         for group_idx, group in enumerate(base_groups):
-            axis_idx = device_idx * len(base_groups) + group_idx
+            axis_idx = device_idx * axes_per_device + group_idx
             ax = axes_list[axis_idx]
             for column in columns_map[group]:
                 column_values = column_data[group][column]
@@ -1562,6 +1614,36 @@ def plot_devices(
             ax.set_ylabel(alias)
             ax.grid(True)
             ax.legend(loc="upper right")
+
+        if apply_bandpass:
+            edge_group = "edge" if "edge" in base_groups else "edge2"
+            axis_idx = device_idx * axes_per_device + len(base_groups)
+            ax = axes_list[axis_idx]
+            edge_values = column_data[edge_group]["Edge(°)"]
+            try:
+                sample_interval = _estimate_sample_interval(timestamps)
+                filtered_edge = apply_chebyshev_bandpass(
+                    edge_values, sample_interval, bandpass[0], bandpass[1]
+                )
+                ax.plot(
+                    timestamps,
+                    filtered_edge,
+                    label=f"Edge BP {bandpass[0]}-{bandpass[1]} Hz",
+                    color="orange",
+                )
+                ax.legend(loc="upper right")
+            except Exception as exc:
+                ax.text(
+                    0.5,
+                    0.5,
+                    str(exc),
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+            ax.set_title("EDGE band-pass")
+            ax.set_ylabel(alias)
+            ax.grid(True)
 
     axes_list[-1].set_xlabel("time")
     axes_list[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
@@ -1585,6 +1667,7 @@ def _plot_devices_plotly(
     title: str | None,
     *,
     ma_window: int,
+    bandpass: tuple[float, float] | None,
 ) -> None:
     """Render time-domain traces using Plotly."""
 
@@ -1616,7 +1699,12 @@ def _plot_devices_plotly(
 
     columns_map = {group: COLUMNS[group] for group in base_groups}
     n_devices = len(rows_by_device)
-    total_axes = n_devices * len(base_groups)
+
+    apply_bandpass = bandpass is not None and any(
+        group in base_groups for group in {"edge", "edge2"}
+    )
+    axes_per_device = len(base_groups) + (1 if apply_bandpass else 0)
+    total_axes = n_devices * axes_per_device
 
     alias_map = {
         device: device_to_sensor_label(device, fallback=f"sensor{idx + 1}")
@@ -1627,6 +1715,8 @@ def _plot_devices_plotly(
     for device in rows_by_device:
         for group in base_groups:
             subplot_titles.append(group.upper())
+        if apply_bandpass:
+            subplot_titles.append("EDGE BAND-PASS")
 
     fig = make_subplots(
         rows=total_axes,
@@ -1642,7 +1732,7 @@ def _plot_devices_plotly(
         timestamps, column_data = collect_group_data(rows, base_groups, columns_map)
         alias = alias_map[device]
         for group_idx, group in enumerate(base_groups):
-            row_idx = device_idx * len(base_groups) + group_idx + 1
+            row_idx = device_idx * axes_per_device + group_idx + 1
             fig.update_yaxes(title_text=alias, row=row_idx, col=1)
             for column in columns_map[group]:
                 column_values = column_data[group][column]
@@ -1689,6 +1779,41 @@ def _plot_devices_plotly(
                         col=1,
                     )
 
+            if apply_bandpass:
+                edge_group = "edge" if "edge" in base_groups else "edge2"
+                row_idx = device_idx * axes_per_device + len(base_groups) + 1
+                fig.update_yaxes(title_text=alias, row=row_idx, col=1)
+                edge_values = column_data[edge_group]["Edge(°)"]
+                try:
+                    sample_interval = _estimate_sample_interval(timestamps)
+                    filtered_edge = apply_chebyshev_bandpass(
+                        edge_values, sample_interval, bandpass[0], bandpass[1]
+                    )
+                    name = f"Edge BP {bandpass[0]}-{bandpass[1]} Hz"
+                    showlegend = name not in shown_legend_names
+                    shown_legend_names.add(name)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=timestamps,
+                            y=filtered_edge,
+                            mode="lines",
+                            name=name,
+                            showlegend=showlegend,
+                            line={"color": "orange"},
+                        ),
+                        row=row_idx,
+                        col=1,
+                    )
+                except Exception as exc:
+                    fig.add_annotation(
+                        xref="paper",
+                        yref="paper",
+                        x=0.5,
+                        y=(row_idx - 0.5) / total_axes,
+                        text=str(exc),
+                        showarrow=False,
+                    )
+
     fig.update_xaxes(title_text="time", row=total_axes, col=1)
     fig.update_layout(
         height=320 + total_axes * 220,
@@ -1708,6 +1833,25 @@ def parse_group_list(value: str) -> List[str]:
             f"Unknown column groups: {', '.join(invalid)}; valid keys are: {', '.join(COLUMNS)}"
         )
     return groups
+
+
+def parse_bandpass(value: str) -> tuple[float, float]:
+    parts = value.split("|")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            "band-pass must be formatted as '<low>|<high>' (Hz)"
+        )
+    try:
+        low = float(parts[0])
+        high = float(parts[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("band-pass cutoffs must be numbers") from exc
+
+    if low <= 0.0 or high <= 0.0:
+        raise argparse.ArgumentTypeError("band-pass cutoffs must be positive")
+    if low >= high:
+        raise argparse.ArgumentTypeError("band-pass low cutoff must be < high cutoff")
+    return low, high
 
 
 def parse_args() -> argparse.Namespace:
@@ -1739,6 +1883,16 @@ def parse_args() -> argparse.Namespace:
             "mad  - Madgwick filter\n"
             "mah  - Mahony filter\n"
             "ekf  - Extended Kalman Filter"
+        ),
+    )
+    parser.add_argument(
+        "-bp",
+        "--bandpass",
+        type=parse_bandpass,
+        help=(
+            "Apply Chebyshev band-pass filter to edge traces and plot the "
+            "filtered result as an extra subplot. Format: <low>|<high> (Hz). "
+            "Ignored unless 'edge' or 'edge2' is requested."
         ),
     )
     parser.add_argument(
@@ -1834,6 +1988,7 @@ def main() -> None:
             block=False,
             ma_window=args.ma_window,
             plot_backend=plot_backend,
+            bandpass=args.bandpass,
         )
         did_plot = True
         if args.fft:
