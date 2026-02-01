@@ -59,6 +59,7 @@ try:
 except PackageNotFoundError:
     PACKAGE_VERSION = _version_from_pyproject() or "0.0.0"
 
+
 def is_header_row(row: Dict[str, str]) -> bool:
     time_value = row.get(TIME_COLUMN, "")
     return isinstance(time_value, str) and time_value.strip().lower() == TIME_COLUMN.lower()
@@ -71,6 +72,7 @@ COLUMNS = {
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),  # magnetometer (magnetic field)
     "q": ("Q0()", "Q1()", "Q2()", "Q3()"),  # quaternion components (sensor orientation)
     "edge": ("Edge(°)",),  # edging/roll angle around the boot forward axis (derived)
+    "edge2": ("Edge(°)", "Pitch(°)", "Yaw(°)"),  # edging plus pitch/yaw from same fusion
     "alt": ("Altitude(m)",),  # GNSS altitude (from *gnss.ride inside a .zip)
     "tilt": ("Pitch(°)", "Roll(°)", "Yaw(°)"),  # pitch/roll from accelerometer + yaw from magnetometer
     "sf0": ("Roll(°)",),  # IMU-only complementary filter (acc + gyro) for roll
@@ -218,6 +220,32 @@ def quaternion_to_edge_deg(q: tuple[float, float, float, float]) -> float:
     # Gravity vector in body frame.
     gy, gz = by, bz
     return math.degrees(math.atan2(gy, gz))
+
+
+def quaternion_to_euler_deg(q: tuple[float, float, float, float]) -> tuple[float, float, float]:
+    """Return roll, pitch, yaw in degrees for quaternion ordered as (w, x, y, z).
+
+    The conversion follows the intrinsic Tait-Bryan ZYX convention used by
+    common AHRS filters and matches the outputs of Madgwick/Mahony/EKF above.
+    """
+
+    w, x, y, z = q
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.degrees(math.atan2(sinr_cosp, cosr_cosp))
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.degrees(math.copysign(math.pi / 2.0, sinp))
+    else:
+        pitch = math.degrees(math.asin(sinp))
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
+
+    return roll, pitch, yaw
 
 
 def parse_timestamp(value: str, row_index: int) -> datetime:
@@ -630,7 +658,10 @@ def collect_group_data(
 
     # Lazy init of optional deps so `--help` still works without runtime extras.
     needs_ahrs = any(group in {"mad", "mah", "ekf"} for group in columns_map)
-    needs_dt = any(group in {"mad", "mah", "ekf", "edge", "sf0"} for group in columns_map)
+    needs_dt = any(
+        group in {"mad", "mah", "ekf", "edge", "edge2", "sf0"}
+        for group in columns_map
+    )
 
     np = None
     q2euler = None
@@ -711,19 +742,43 @@ def collect_group_data(
                 column_data[group]["Q2()"].append(q2)
                 column_data[group]["Q3()"].append(q3)
                 continue
-            if group == "edge":
+            if group in {"edge", "edge2"}:
+                def append_edge_from_quat(quat: tuple[float, float, float, float]) -> None:
+                    edge_deg = quaternion_to_edge_deg(quat)
+                    column_data[group]["Edge(°)"].append(edge_deg)
+                    if group == "edge2":
+                        _roll_deg, pitch_deg, yaw_deg = quaternion_to_euler_deg(quat)
+                        column_data[group]["Pitch(°)"].append(pitch_deg)
+                        column_data[group]["Yaw(°)"].append(yaw_deg)
+
+                def append_edge_last() -> None:
+                    last_edge = (
+                        column_data[group]["Edge(°)"][-1]
+                        if column_data[group]["Edge(°)"]
+                        else 0.0
+                    )
+                    column_data[group]["Edge(°)"].append(last_edge)
+                    if group == "edge2":
+                        last_pitch = (
+                            column_data[group]["Pitch(°)"][-1]
+                            if column_data[group]["Pitch(°)"]
+                            else 0.0
+                        )
+                        last_yaw = (
+                            column_data[group]["Yaw(°)"][-1]
+                            if column_data[group]["Yaw(°)"]
+                            else 0.0
+                        )
+                        column_data[group]["Pitch(°)"].append(last_pitch)
+                        column_data[group]["Yaw(°)"].append(last_yaw)
+
                 quat = extract_quaternion_wxyz(row)
                 if quat is not None:
-                    qw, qx, qy, qz = quat
-                    column_data[group]["Edge(°)"].append(
-                        quaternion_to_edge_deg((qw, qx, qy, qz))
-                    )
+                    append_edge_from_quat(quat)
                     continue
 
                 if column_data[group]["Edge(°)"]:
-                    column_data[group]["Edge(°)"].append(
-                        column_data[group]["Edge(°)"][-1]
-                    )
+                    append_edge_last()
                     continue
 
                 # No quaternions in the input (or first samples are missing):
@@ -735,8 +790,8 @@ def collect_group_data(
                         from ahrs.filters import Madgwick
                     except ModuleNotFoundError as exc:
                         raise RuntimeError(
-                            "Missing optional dependency for 'edge' group when quaternions are not available. "
-                            "Install with `pip install ahrs`."
+                            "Missing optional dependency for 'edge'/'edge2' group when quaternions "
+                            "are not available. Install with `pip install ahrs`."
                         ) from exc
                     edge_filter = Madgwick()
                     edge_q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
@@ -756,7 +811,7 @@ def collect_group_data(
                     or gz_val is None
                 ):
                     raise KeyError(
-                        "CSV is missing one of the required IMU columns for 'edge': "
+                        "CSV is missing one of the required IMU columns for 'edge'/'edge2': "
                         "'AccX(g)', 'AccY(g)', 'AccZ(g)', 'AsX(°/s)', 'AsY(°/s)', 'AsZ(°/s)'"
                     )
                 try:
@@ -811,12 +866,7 @@ def collect_group_data(
 
                 # If the acceleration magnitude is invalid, keep the last angle.
                 if float(np.linalg.norm(acc)) == 0.0:
-                    last_value = (
-                        column_data[group]["Edge(°)"][-1]
-                        if column_data[group]["Edge(°)"]
-                        else 0.0
-                    )
-                    column_data[group]["Edge(°)"].append(last_value)
+                    append_edge_last()
                     continue
 
                 try:
@@ -837,18 +887,16 @@ def collect_group_data(
                             dt=dt,
                         )
                 except Exception:
-                    last_value = (
-                        column_data[group]["Edge(°)"][-1]
-                        if column_data[group]["Edge(°)"]
-                        else 0.0
-                    )
-                    column_data[group]["Edge(°)"].append(last_value)
+                    append_edge_last()
                     continue
 
-                qw, qx, qy, qz = (float(edge_q[0]), float(edge_q[1]), float(edge_q[2]), float(edge_q[3]))
-                column_data[group]["Edge(°)"].append(
-                    quaternion_to_edge_deg((qw, qx, qy, qz))
+                qw, qx, qy, qz = (
+                    float(edge_q[0]),
+                    float(edge_q[1]),
+                    float(edge_q[2]),
+                    float(edge_q[3]),
                 )
+                append_edge_from_quat((qw, qx, qy, qz))
                 continue
             if group == "sf0":
                 ax_val = row.get("AccX(g)")
@@ -1684,6 +1732,7 @@ def parse_args() -> argparse.Namespace:
             "h    - magnetic field (magnetometer)\n"
             "q    - quaternion components (Q0..Q3)\n"
             "edge - edging angle around boot forward axis\n"
+            "edge2 - edging angle plus pitch/yaw from same fusion\n"
             "alt  - GNSS altitude from *gnss.ride in a .zip\n"
             "tilt - pitch/roll from accelerometer + yaw heading\n"
             "sf0  - IMU-only roll fusion (acc + gyro)\n"
