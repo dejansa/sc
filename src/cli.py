@@ -71,6 +71,8 @@ COLUMNS = {
     "as": ("AsX(°/s)", "AsY(°/s)", "AsZ(°/s)"),  # gyroscope (angular speed)
     "h": ("HX(uT)", "HY(uT)", "HZ(uT)"),  # magnetometer (magnetic field)
     "q": ("Q0()", "Q1()", "Q2()", "Q3()"),  # quaternion components (sensor orientation)
+    "eul1": ("Eul1X(°)", "Eul1Y(°)", "Eul1Z(°)"),  # quat->euler (assume ENU convention)
+    "eul2": ("Eul2X(°)", "Eul2Y(°)", "Eul2Z(°)"),  # quat->euler (assume NED convention)
     "edge": ("Edge(°)",),  # edging/roll angle around the boot forward axis (derived)
     "edge2": ("Edge(°)", "Pitch(°)", "Yaw(°)"),  # edging plus pitch/yaw from same fusion
     "alt": ("Altitude(m)",),  # GNSS altitude (from *gnss.ride inside a .zip)
@@ -85,6 +87,12 @@ ANGLE_COLORS = {
     "AngleX(°)": "blue",
     "AngleY(°)": "green",
     "AngleZ(°)": "magenta",
+    "Eul1X(°)": "blue",
+    "Eul1Y(°)": "green",
+    "Eul1Z(°)": "magenta",
+    "Eul2X(°)": "blue",
+    "Eul2Y(°)": "green",
+    "Eul2Z(°)": "magenta",
 }
 
 
@@ -199,27 +207,35 @@ def quaternion_to_edge_deg(q: tuple[float, float, float, float]) -> float:
 
     qw, qx, qy, qz = q
 
-    # Compute g_body = q*conj applied to world-down vector (0, 0, -1).
-    # We implement: g_body = q_conj * (0, g_world) * q, returning vector part.
-    # This matches the pseudocode from `quart.md`.
-    cw, cx, cy, cz = (qw, -qx, -qy, -qz)
-
-    # vq = (0, 0, 0, -1)
+    # Rotate world-down vector (0, 0, -1) into the body frame.
+    #
+    # Important detail: the sensor quaternions in our TSV exports behave like a
+    # world->body rotation (or, equivalently, the inverse of the body->world
+    # rotation used by some textbook formulas). To match the vendor's reported
+    # Euler angles (Z-Y-X) and keep Edge near 0° when level, we apply:
+    #   v_body = q * v_world * conj(q)
+    #
+    # This fixes the 180° offset that happens when using conj(q) * v * q with
+    # this device's convention.
     vw, vx, vy, vz = (0.0, 0.0, 0.0, -1.0)
 
-    # First multiply: a = conj(q) * vq
-    aw = cw * vw - cx * vx - cy * vy - cz * vz
-    ax = cw * vx + cx * vw + cy * vz - cz * vy
-    ay = cw * vy - cx * vz + cy * vw + cz * vx
-    az = cw * vz + cx * vy - cy * vx + cz * vw
+    # First multiply: a = q * vq
+    aw = qw * vw - qx * vx - qy * vy - qz * vz
+    ax = qw * vx + qx * vw + qy * vz - qz * vy
+    ay = qw * vy - qx * vz + qy * vw + qz * vx
+    az = qw * vz + qx * vy - qy * vx + qz * vw
 
-    # Then multiply: b = a * q
-    by = aw * qy - ax * qz + ay * qw + az * qx
-    bz = aw * qz + ax * qy - ay * qx + az * qw
+    # Then multiply: b = a * conj(q)
+    cw, cx, cy, cz = (qw, -qx, -qy, -qz)
+    by = aw * cy - ax * cz + ay * cw + az * cx
+    bz = aw * cz + ax * cy - ay * cx + az * cw
 
     # Gravity vector in body frame.
     gy, gz = by, bz
-    return math.degrees(math.atan2(gy, gz))
+
+    # Roll about the boot forward axis (+X): when level, gz≈-1 so atan2(gy,-gz)
+    # yields ~0°. Positive means rolling toward +Y.
+    return math.degrees(math.atan2(gy, -gz))
 
 
 def quaternion_to_euler_deg(q: tuple[float, float, float, float]) -> tuple[float, float, float]:
@@ -246,6 +262,59 @@ def quaternion_to_euler_deg(q: tuple[float, float, float, float]) -> tuple[float
     yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp))
 
     return roll, pitch, yaw
+
+
+def quaternion_conjugate(q: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Return the conjugate of quaternion (w, x, y, z)."""
+
+    w, x, y, z = q
+    return (w, -x, -y, -z)
+
+
+def quaternion_multiply(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Hamilton product of two quaternions (w, x, y, z)."""
+
+    w1, x1, y1, z1 = left
+    w2, x2, y2, z2 = right
+    return (
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    )
+
+
+def quaternion_ned_to_enu(q_ned: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Convert a quaternion expressed in NED world axes to ENU world axes.
+
+    NED uses axes (X north, Y east, Z down). ENU uses (X east, Y north, Z up).
+    The change-of-basis between them is a 180° rotation about the axis
+    (1, 1, 0) / sqrt(2), with quaternion (0, 1/sqrt(2), 1/sqrt(2), 0).
+
+    This conversion is useful when input quaternions are reported using NED
+    conventions but we want Euler angles aligned with the ENU interpretation.
+    """
+
+    half_sqrt2 = math.sqrt(0.5)
+    q_conv = (0.0, half_sqrt2, half_sqrt2, 0.0)
+    q_conv_inv = quaternion_conjugate(q_conv)
+    return quaternion_multiply(q_ned, q_conv_inv)
+
+
+def quaternion_to_euler_xyz_deg_enu(
+    q_enu: tuple[float, float, float, float],
+) -> tuple[float, float, float]:
+    """Return Euler angles (x, y, z) in degrees for an ENU quaternion.
+
+    Uses the same intrinsic ZYX convention as `quaternion_to_euler_deg`, but
+    labels the outputs as rotations about X, Y, Z for plotting purposes.
+    """
+
+    roll_deg, pitch_deg, yaw_deg = quaternion_to_euler_deg(q_enu)
+    return roll_deg, pitch_deg, yaw_deg
 
 
 def parse_timestamp(value: str, row_index: int) -> datetime:
@@ -675,6 +744,11 @@ def collect_group_data(
     edge_filter = None
     edge_q = None
 
+    last_euler_xyz_deg: Dict[str, tuple[float, float, float]] = {
+        "eul1": (0.0, 0.0, 0.0),
+        "eul2": (0.0, 0.0, 0.0),
+    }
+
     # Complementary filter state for IMU-only fusion (`sf0`).
     sf0_roll_rad = 0.0
     sf0_initialized = False
@@ -741,6 +815,22 @@ def collect_group_data(
                 column_data[group]["Q1()"].append(q1)
                 column_data[group]["Q2()"].append(q2)
                 column_data[group]["Q3()"].append(q3)
+                continue
+            if group in {"eul1", "eul2"}:
+                quat = extract_quaternion_wxyz(row)
+                if quat is not None:
+                    if group == "eul1":
+                        q_enu = quat
+                    else:
+                        q_enu = quaternion_ned_to_enu(quat)
+                    x_deg, y_deg, z_deg = quaternion_to_euler_xyz_deg_enu(q_enu)
+                    last_euler_xyz_deg[group] = (x_deg, y_deg, z_deg)
+                else:
+                    x_deg, y_deg, z_deg = last_euler_xyz_deg[group]
+
+                column_data[group][columns[0]].append(x_deg)
+                column_data[group][columns[1]].append(y_deg)
+                column_data[group][columns[2]].append(z_deg)
                 continue
             if group in {"edge", "edge2"}:
                 def append_edge_from_quat(quat: tuple[float, float, float, float]) -> None:
@@ -1121,7 +1211,7 @@ def collect_group_data(
 
     for group, columns in columns_map.items():
         for column in columns:
-            if column.startswith("Angle") or column in {"Yaw(°)", "Edge(°)"}:
+            if column.startswith(("Angle", "Eul")) or column in {"Yaw(°)", "Edge(°)"}:
                 column_data[group][column] = unwrap_degrees(column_data[group][column])
     return timestamps, column_data
 
@@ -1574,9 +1664,13 @@ def plot_devices(
 
     base_groups = column_groups
 
-    if "q" in base_groups and not has_quaternion_values(rows_by_device):
+    if any(group in base_groups for group in {"q", "eul1", "eul2"}) and not has_quaternion_values(rows_by_device):
         print("no Q values in this file")
-        base_groups = [group for group in base_groups if group != "q"]
+        base_groups = [
+            group
+            for group in base_groups
+            if group not in {"q", "eul1", "eul2"}
+        ]
 
     if not base_groups:
         return
@@ -1609,7 +1703,11 @@ def plot_devices(
             ax = axes_list[axis_idx]
             for column in columns_map[group]:
                 column_values = column_data[group][column]
-                plot_color = ANGLE_COLORS.get(column) if group == "ang" else None
+                plot_color = (
+                    ANGLE_COLORS.get(column)
+                    if group in {"ang", "eul1", "eul2"}
+                    else None
+                )
                 ax.plot(timestamps, column_values, label=column, color=plot_color)
                 if group != "sf0" and ma_window >= 2 and column_values:
                     ma_values = compute_moving_average(column_values, ma_window)
@@ -1704,9 +1802,13 @@ def _plot_devices_plotly(
 
     base_groups = column_groups
 
-    if "q" in base_groups and not has_quaternion_values(rows_by_device):
+    if any(group in base_groups for group in {"q", "eul1", "eul2"}) and not has_quaternion_values(rows_by_device):
         print("no Q values in this file")
-        base_groups = [group for group in base_groups if group != "q"]
+        base_groups = [
+            group
+            for group in base_groups
+            if group not in {"q", "eul1", "eul2"}
+        ]
 
     if not base_groups:
         return
@@ -1750,7 +1852,11 @@ def _plot_devices_plotly(
             fig.update_yaxes(title_text=alias, row=row_idx, col=1)
             for column in columns_map[group]:
                 column_values = column_data[group][column]
-                plot_color = ANGLE_COLORS.get(column) if group == "ang" else None
+                plot_color = (
+                    ANGLE_COLORS.get(column)
+                    if group in {"ang", "eul1", "eul2"}
+                    else None
+                )
 
                 name = column
                 showlegend = name not in shown_legend_names
@@ -1898,6 +2004,8 @@ def parse_args() -> argparse.Namespace:
             "as   - angular speed (gyroscope)\n"
             "h    - magnetic field (magnetometer)\n"
             "q    - quaternion components (Q0..Q3)\n"
+            "eul1 - quaternion -> euler (assume ENU convention)\n"
+            "eul2 - quaternion -> euler (assume NED convention)\n"
             "edge - edging angle around boot forward axis\n"
             "edge2 - edging angle plus pitch/yaw from same fusion\n"
             "alt  - GNSS altitude from *gnss.ride in a .zip\n"
