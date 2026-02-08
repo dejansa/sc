@@ -5,6 +5,7 @@ import xml.etree.ElementTree as ET
 from typing import Any, Dict, Pattern
 
 PISTE_PATH = "/mnt/c/Users/DSavkovic/Downloads/ski/planet_pistes.osm/planet_pistes-osmium.osm"
+PISTE_STATE_PATH = "/mnt/c/Users/DSavkovic/Downloads/ski/planet_pistes-state.txt"
 
 
 def _local_name(tag: str) -> str:
