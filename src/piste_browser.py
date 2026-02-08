@@ -1,14 +1,18 @@
-import json
 import argparse
+import json
 import sqlite3
-from typing import Dict
+import tempfile
+import webbrowser
+from pathlib import Path
+from typing import Any, Dict, List
 
 DB_PATH = "data/piste/data.db"
+ResortWays = Dict[str, Dict[str, List[Dict[str, Any]]]]
 
 
-def get_resort_ways(resort_name: str) -> Dict[int, str]:
-    """Return a map of relation IDs to matching names for the resort."""
-    resort_ways = {}
+def get_resort_ways(resort_name: str) -> ResortWays:
+    """Return a map of resort names to their way metadata."""
+    resort_ways: ResortWays = {}
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -17,17 +21,11 @@ def get_resort_ways(resort_name: str) -> Dict[int, str]:
         FROM relation_with_tags
         WHERE (tag_key='name' AND tag_value LIKE ?) OR (tag_key='name:en' AND tag_value LIKE ?)
         LIMIT 100
-    ''', (f"%{resort_name}%",f"%{resort_name}%"))
+    ''', (f"%{resort_name}%", f"%{resort_name}%"))
     relations = cursor.fetchall()
-    # conn.close()
-    # print(f"{len(relations)=}")
     for relation in relations:
-        # print("===============================")
-        # print(f"{relation=}")
-        resort_ways[relation[1]] = {"ways": []}
-        # select data from relation_with_members
-        conn = sqlite3.connect(DB_PATH)
-        # cursor = conn.cursor()
+        resort_key = relation[1]
+        resort_ways.setdefault(resort_key, {"ways": []})
         cursor.execute('''
             SELECT member_type, member_ref, role
             FROM relation_with_members
@@ -35,58 +33,61 @@ def get_resort_ways(resort_name: str) -> Dict[int, str]:
         ''', (relation[0],))
         members = cursor.fetchall()
         for member in members:
-            # print("  -------------------------------")
-            # print(f"  {member=}")
-            # resort_ways[relation[1]][f"{member[0]}s"][member[1]] = {"type": member[0], "role": member[2]}
             if member[0] == 'way':
-                resort_ways[relation[1]]["ways"].append({"type": member[0], "nodes": []})
+                current_way = {"type": member[0], "nodes": []}
+                resort_ways[resort_key]["ways"].append(current_way)
                 cursor.execute('''
-                    SELECT id, tag_key, tag_value
+                    SELECT tag_key, tag_value
                     FROM way_with_tags
                     WHERE id=?
                 ''', (member[1],))
                 way_tags = cursor.fetchall()
-                # print("    ---")
                 for way_tag in way_tags:
-                    # print(f"    {way_tag=}")
-                    resort_ways[relation[1]]["ways"][-1][way_tag[1]] = way_tag[2]
+                    current_way[way_tag[0]] = way_tag[1]
                 cursor.execute('''
-                    SELECT *
+                    SELECT node_id
                     FROM way_with_nodes
                     WHERE id=?
+                    ORDER BY ord
                 ''', (member[1],))
-                way_nodes = cursor.fetchall()
-                # print("    ---")
-                for way_node in way_nodes:
-                    # print(f"    {way_node=}")
+                node_refs = cursor.fetchall()
+                for node_ref in node_refs:
                     cursor.execute('''
                         SELECT id, lat, lon
                         FROM nodes
                         WHERE id=?
-                    ''', (way_node[1],))
-                    way_nodes = cursor.fetchall()
-                    # print("      ---")
-                    # print(f"      {way_nodes=}")
-                    resort_ways[relation[1]]["ways"][-1]["nodes"].append({"lat": way_nodes[0][1], "lon": way_nodes[0][2]})
+                    ''', (node_ref[0],))
+                    node_rows = cursor.fetchall()
+                    if not node_rows:
+                        continue
+                    node = node_rows[0]
+                    current_way["nodes"].append(
+                        {"lat": float(node[1]), "lon": float(node[2])}
+                    )
             elif member[0] == 'node':
-                resort_ways[relation[1]]["ways"].append({"type": member[0], "role": member[2], "nodes": []})
+                current_way = {"type": member[0], "role": member[2], "nodes": []}
+                resort_ways[resort_key]["ways"].append(current_way)
                 cursor.execute('''
                     SELECT id, lat, lon
                     FROM nodes
                     WHERE id=?
                 ''', (member[1],))
-                node_data = cursor.fetchall()
-                # print(f"      {node_data=}")
-                resort_ways[relation[1]]["ways"][-1]["nodes"].append({"lat": node_data[0][1], "lon": node_data[0][2]})
-
-                # print(f"    {way_tags=}")
+                node_rows = cursor.fetchall()
+                if not node_rows:
+                    continue
+                node = node_rows[0]
+                current_way["nodes"].append(
+                    {"lat": float(node[1]), "lon": float(node[2])}
+                )
     conn.close()
     return resort_ways
 
 
 def parse_arguments() -> argparse.Namespace:
     """Parse CLI arguments for the piste browser script."""
-    parser = argparse.ArgumentParser(description="List resort relation details from the piste database.")
+    parser = argparse.ArgumentParser(
+        description="List resort relation details from the piste database."
+    )
     parser.add_argument(
         "-r",
         "--resort",
@@ -96,89 +97,156 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "-p",
         "--piste",
-        default="1",
+        default=None,
         help="Piste name to query",
+    )
+    parser.add_argument(
+        "-m",
+        "--map",
+        action="store_true",
+        help="Open a map showing nodes for the selected piste",
     )
     return parser.parse_args()
 
 
-def show_resort_details(resort_ways: Dict[int, str]) -> None:
-    """Print details about the resort ways."""
-    # print(f"Resort ways for {args.resort}: {json.dumps(resort_ways, indent=2)}")
+def show_resort_details(resort_ways: ResortWays) -> None:
+    """Print overview details for every resort captured in the database."""
     for resort_name, resort_data in resort_ways.items():
         print(f"Resort: {resort_name}")
         for way in resort_data["ways"]:
-            if "aerialway" not in way and "role" not in way:
-                name = way.get("name")
-                if name:
-                    ref = way.get('ref') or way.get('piste:ref') or '??'
-                    print(f"  {ref}) {name}:  dificulty: {way.get('piste:difficulty', '??')}")
-                    # print(f"    dificulty: {way.get('piste:difficulty', '??')}")
-                    # print(f"    dificulty: {way.get('piste:difficulty', '??')} type: {way.get('piste:type', '??')}")
-                    # print(f"    type: {way.get('piste:type', '??')}")
-                    tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
-                    print(f"    Tags: {tags}")
-                # for node in way["nodes"]:
-                #     print(f"    Node: lat={node['lat']}, lon={node['lon']}")
+            if "aerialway" in way or "role" in way:
+                continue
+            name = way.get("name")
+            if not name:
+                continue
+            ref = way.get("ref") or way.get("piste:ref") or "??"
+            difficulty = way.get("piste:difficulty", "??")
+            print(f"  {ref}) {name}:  dificulty: {difficulty}")
+            tags = {k: v for k, v in way.items() if k not in ["type", "nodes"]}
+            print(f"    Tags: {tags}")
         print()
-        # for way in resort_data["ways"]:
-        #     if "aerialway" not in way and "role" not in way:
-        #         name = way.get("name")
-        #         if name is None:
-        #             print(f"    dificulty: {way.get('piste:difficulty', '??')} type: {way.get('piste:type', '??')} area: {way.get('area', '??')}")
-        #             # print(f"    dificulty: {way.get('piste:difficulty', '??')}")
-        #             tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
-        #             print(f"    Tags: {tags}")
-        #         # for node in way["nodes"]:
-        #         #     print(f"    Node: lat={node['lat']}, lon={node['lon']}")
 
 
-                # print(f"    Tags: { {k: v for k, v in way.items() if k not in ['type', 'nodes']} }")
-
-            # print(f"  Way type: {way['type']}")
-            # if way['type'] == 'way':
-            #     print(f"    Tags: { {k: v for k, v in way.items() if k not in ['type', 'nodes']} }")
-            # for node in way["nodes"]:
-            #     print(f"    Node: lat={node['lat']}, lon={node['lon']}")
-    # for piste in pistes:
-    #     print(piste, type(piste))
-
-    # for resort_name, resort_data in resort_ways.items():
-    #     print(f"Resort: {resort_name}")
-    #     for way in resort_data["ways"]:
-    #         if "aerialway" not in way and "role" not in way:
-    #             name = way.get("name")
-    #             if name:
-    #                 ref = way.get('ref') or way.get('piste:ref') or '??'
-    #                 print(f"  {ref}) {name}:  dificulty: {way.get('piste:difficulty', '??')}")
-    #                 tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
-    #                 print(f"    Tags: {tags}")
-    #     print()
-
-
-def show_piste_details(resort_ways: Dict[int, str], piste_name: str) -> None:
-    """Print details about the pistes in the resort."""
+def show_piste_details(
+    resort_ways: ResortWays, piste_name: str
+) -> List[Dict[str, float]]:
+    """Print selected pistes and return the node coordinates used for mapping."""
+    matched_nodes: List[Dict[str, float]] = []
+    query_raw = piste_name.strip()
+    query = query_raw.lower()
+    is_ref_query = query_raw.isdigit()
     for resort_name, resort_data in resort_ways.items():
         print(f"Resort: {resort_name}")
         for way in resort_data["ways"]:
-            if "aerialway" not in way and "role" not in way:
-                name = way.get("name", "")
-                if piste_name.lower() in name.lower():
-                    ref = way.get('ref') or way.get('piste:ref') or '??'
-                    print(f"  {ref}) {name}:  dificulty: {way.get('piste:difficulty', '??')}")
-                    tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
-                    print(f"    Tags: {tags}")
-                    for node in way["nodes"]:
-                        print(f"    Node: lat={node['lat']}, lon={node['lon']}")
+            if "aerialway" in way or "role" in way:
+                continue
+            name = way.get("name", "")
+            ref_value = way.get("ref") or way.get("piste:ref") or ""
+            if is_ref_query:
+                if ref_value != query_raw:
+                    continue
+            else:
+                if query and query not in name.lower():
+                    continue
+            ref_display = ref_value or "??"
+            difficulty = way.get("piste:difficulty", "??")
+            print(f"  {ref_display}) {name}:  dificulty: {difficulty}")
+            tags = {k: v for k, v in way.items() if k not in ["type", "nodes"]}
+            print(f"    Tags: {tags}")
+            for node in way["nodes"]:
+                lat = float(node["lat"])
+                lon = float(node["lon"])
+                print(f"    Node: lat={lat}, lon={lon}")
+                matched_nodes.append({"lat": lat, "lon": lon})
         print()
+    return matched_nodes
+
+
+def create_piste_map(
+    nodes: List[Dict[str, float]], resort_name: str, piste_name: str
+) -> Path | None:
+    """Render a small Leaflet map for the nodes and open it in the browser."""
+    if not nodes:
+        print("No nodes were collected for the requested piste; skipping map.")
+        return None
+    safe_name = "".join(
+        c if c.isalnum() else "_" for c in f"{resort_name}_{piste_name}"
+    )
+    points = [[float(node["lat"]), float(node["lon"])] for node in nodes]
+    points_js = json.dumps(points)
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset=\"utf-8\" />
+<title>{resort_name} - {piste_name} map</title>
+<link
+    rel=\"stylesheet\"
+    href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\"
+/>
+<style>
+    body,
+    html {{
+        margin: 0;
+        height: 100%;
+    }}
+    #map {{
+        width: 100%;
+        height: 100vh;
+    }}
+</style>
+</head>
+<body>
+<div id=\"map\"></div>
+<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
+<script>
+    const points = {points_js};
+    if (!window.L) {{
+        document.getElementById('map').innerHTML =
+            'Leaflet failed to load. Check network access to unpkg.com.';
+    }} else {{
+        const map = L.map('map');
+        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap contributors',
+        }}).addTo(map);
+
+        for (const point of points) {{
+            L.circleMarker(point, {{ radius: 5 }}).addTo(map);
+        }}
+
+        const bounds = L.latLngBounds(points);
+        map.fitBounds(bounds.pad(0.15));
+    }}
+</script>
+</body>
+</html>"""
+    # Use a unique filename per run to avoid browser caching a stale local file.
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix=f"piste_map_{safe_name}_",
+        suffix=".html",
+        delete=False,
+        encoding="utf-8",
+    ) as temp_file:
+        temp_file.write(html)
+        map_path = Path(temp_file.name)
+    print(f"Written map to {map_path}; opening in browser...")
+    webbrowser.open(map_path.as_uri())
+    return map_path
 
 
 def main() -> None:
     """Run the primary CLI workflow."""
     args = parse_arguments()
+    # print(args)
     resort_ways = get_resort_ways(args.resort)
-    # show_resort_details(resort_ways)
-    show_piste_details(resort_ways, args.piste)
+    if args.piste:
+        matched_nodes = show_piste_details(resort_ways, args.piste)
+        if args.map:
+            create_piste_map(matched_nodes, args.resort, args.piste)
+    else:
+        show_resort_details(resort_ways)
+
 
 if __name__ == "__main__":
     main()
