@@ -93,13 +93,17 @@ def parse_arguments() -> argparse.Namespace:
         default="Kopaonik",
         help="Resort name to query",
     )
+    parser.add_argument(
+        "-p",
+        "--piste",
+        default="1",
+        help="Piste name to query",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    """Run the primary CLI workflow."""
-    args = parse_arguments()
-    resort_ways = get_resort_ways(args.resort)
+def show_resort_details(resort_ways: Dict[int, str]) -> None:
+    """Print details about the resort ways."""
     # print(f"Resort ways for {args.resort}: {json.dumps(resort_ways, indent=2)}")
     for resort_name, resort_data in resort_ways.items():
         print(f"Resort: {resort_name}")
@@ -107,24 +111,26 @@ def main() -> None:
             if "aerialway" not in way and "role" not in way:
                 name = way.get("name")
                 if name:
-                    print(f"  {name}:")
-                    print(f"    dificulty: {way.get('piste:difficulty', '??')} type: {way.get('piste:type', '??')}")
-                    # print(f"    type: {way.get('piste:type', '??')}")
-                    # tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
-                    # print(f"    Tags: {tags}")
-                for node in way["nodes"]:
-                    print(f"    Node: lat={node['lat']}, lon={node['lon']}")
-        print()
-        for way in resort_data["ways"]:
-            if "aerialway" not in way and "role" not in way:
-                name = way.get("name")
-                if name is None:
-                    print(f"    dificulty: {way.get('piste:difficulty', '??')} type: {way.get('piste:type', '??')}")
+                    ref = way.get('ref') or way.get('piste:ref') or '??'
+                    print(f"  {ref}) {name}:  dificulty: {way.get('piste:difficulty', '??')}")
                     # print(f"    dificulty: {way.get('piste:difficulty', '??')}")
+                    # print(f"    dificulty: {way.get('piste:difficulty', '??')} type: {way.get('piste:type', '??')}")
+                    # print(f"    type: {way.get('piste:type', '??')}")
                     tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
                     print(f"    Tags: {tags}")
-                for node in way["nodes"]:
-                    print(f"    Node: lat={node['lat']}, lon={node['lon']}")
+                # for node in way["nodes"]:
+                #     print(f"    Node: lat={node['lat']}, lon={node['lon']}")
+        print()
+        # for way in resort_data["ways"]:
+        #     if "aerialway" not in way and "role" not in way:
+        #         name = way.get("name")
+        #         if name is None:
+        #             print(f"    dificulty: {way.get('piste:difficulty', '??')} type: {way.get('piste:type', '??')} area: {way.get('area', '??')}")
+        #             # print(f"    dificulty: {way.get('piste:difficulty', '??')}")
+        #             tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
+        #             print(f"    Tags: {tags}")
+        #         # for node in way["nodes"]:
+        #         #     print(f"    Node: lat={node['lat']}, lon={node['lon']}")
 
 
                 # print(f"    Tags: { {k: v for k, v in way.items() if k not in ['type', 'nodes']} }")
@@ -137,6 +143,42 @@ def main() -> None:
     # for piste in pistes:
     #     print(piste, type(piste))
 
+    # for resort_name, resort_data in resort_ways.items():
+    #     print(f"Resort: {resort_name}")
+    #     for way in resort_data["ways"]:
+    #         if "aerialway" not in way and "role" not in way:
+    #             name = way.get("name")
+    #             if name:
+    #                 ref = way.get('ref') or way.get('piste:ref') or '??'
+    #                 print(f"  {ref}) {name}:  dificulty: {way.get('piste:difficulty', '??')}")
+    #                 tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
+    #                 print(f"    Tags: {tags}")
+    #     print()
+
+
+def show_piste_details(resort_ways: Dict[int, str], piste_name: str) -> None:
+    """Print details about the pistes in the resort."""
+    for resort_name, resort_data in resort_ways.items():
+        print(f"Resort: {resort_name}")
+        for way in resort_data["ways"]:
+            if "aerialway" not in way and "role" not in way:
+                name = way.get("name", "")
+                if piste_name.lower() in name.lower():
+                    ref = way.get('ref') or way.get('piste:ref') or '??'
+                    print(f"  {ref}) {name}:  dificulty: {way.get('piste:difficulty', '??')}")
+                    tags = {k: v for k, v in way.items() if k not in ['type', 'nodes']}
+                    print(f"    Tags: {tags}")
+                    for node in way["nodes"]:
+                        print(f"    Node: lat={node['lat']}, lon={node['lon']}")
+        print()
+
+
+def main() -> None:
+    """Run the primary CLI workflow."""
+    args = parse_arguments()
+    resort_ways = get_resort_ways(args.resort)
+    # show_resort_details(resort_ways)
+    show_piste_details(resort_ways, args.piste)
 
 if __name__ == "__main__":
     main()
