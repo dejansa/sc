@@ -1,6 +1,8 @@
+import argparse
+import json
 import re
 import xml.etree.ElementTree as ET
-from typing import Any, Dict
+from typing import Any, Dict, Pattern
 
 PISTE_PATH = "/mnt/c/Users/DSavkovic/Downloads/ski/planet_pistes.osm/planet_pistes-osmium.osm"
 
@@ -25,9 +27,18 @@ def _extract_tags(element: ET.Element) -> Dict[str, str]:
     return tags
 
 
-def parse_piste_data() -> Dict[str, Dict[str, Any]]:
-    """Return a Krvavec-focused summary of every matching way/relation in the OSM file."""
-    name_pattern = re.compile(r"krvavec", re.IGNORECASE)
+def _build_search_pattern(piste_name: str) -> Pattern[str]:
+    """Build a case-insensitive pattern for user-supplied piste names."""
+
+    normalized = piste_name.strip()
+    if not normalized:
+        raise ValueError("Piste name must not be empty")
+    return re.compile(re.escape(normalized), re.IGNORECASE)
+
+
+def parse_piste_data(piste_name: str) -> Dict[str, Dict[str, Any]]:
+    """Return a summary of every matching way/relation in the OSM file for the requested piste."""
+    name_pattern = _build_search_pattern(piste_name)
     piste_data: Dict[str, Dict[str, Any]] = {}
 
     for event, element in ET.iterparse(PISTE_PATH, events=("end",)):
@@ -44,17 +55,17 @@ def parse_piste_data() -> Dict[str, Dict[str, Any]]:
             element.clear()
             continue
 
-        found_krvavec = any(name_pattern.search(value) for value in tags.values())
-        name_has_krvavec = bool(name_pattern.search(tags.get("name", "")))
+        found_match = any(name_pattern.search(value) for value in tags.values())
+        name_matches = bool(name_pattern.search(tags.get("name", "")))
         is_winter_sports = tags.get("landuse") == "winter_sports"
         is_site_piste = tags.get("site") == "piste"
         is_type_site = tags.get("type") == "site"
 
         if not (
-            found_krvavec
-            or name_has_krvavec
-            or (is_winter_sports and name_has_krvavec)
-            or (tag_name == "relation" and (is_site_piste or is_type_site) and name_has_krvavec)
+            found_match
+            or name_matches
+            or (is_winter_sports and name_matches)
+            or (tag_name == "relation" and (is_site_piste or is_type_site) and name_matches)
         ):
             element.clear()
             continue
@@ -88,10 +99,18 @@ def parse_piste_data() -> Dict[str, Dict[str, Any]]:
 
 
 def main() -> None:
-    """Print the number of Krvavec-related features found in the piste file."""
-    piste_data = parse_piste_data()
-    print(f"Found {len(piste_data)} Krvavec elements")
-    print(f"{piste_data=}")
+    """Parse the piste name argument and print how many matching elements were found."""
+    parser = argparse.ArgumentParser(description="Count piste-related features in the OSM dump.")
+    parser.add_argument("piste_name", help="Case-insensitive substring to match in piste tags")
+    args = parser.parse_args()
+
+    try:
+        piste_data = parse_piste_data(args.piste_name)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    print(f"Found {len(piste_data)} elements matching {args.piste_name!r}")
+    print(f"piste data: {json.dumps(piste_data, indent=2)}")
 
 
 if __name__ == "__main__":
