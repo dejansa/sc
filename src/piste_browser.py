@@ -253,16 +253,29 @@ def create_piste_map(
 def main() -> None:
     """Run the primary CLI workflow."""
     args = parse_arguments()
-    # print(args)
     resort_ways = get_resort_ways(args.resort)
     if args.piste:
         matched_nodes = show_piste_details(resort_ways, args.piste)
         if args.map:
             create_piste_map(matched_nodes, args.resort, args.piste)
     else:
-        # print(f"resort_ways: {json.dumps(resort_ways, indent=2)}")
         print(f"resort_ways: {resort_ways}")
         show_resort_details(resort_ways)
+        if args.map:
+            # Collect all way nodes for all pistes in the resort
+            all_ways_nodes = []
+            for resort_data in resort_ways.values():
+                for way in resort_data["ways"]:
+                    if "aerialway" in way or "role" in way:
+                        continue
+                    way_nodes = []
+                    for node in way["nodes"]:
+                        lat = float(node["lat"])
+                        lon = float(node["lon"])
+                        way_nodes.append({"lat": lat, "lon": lon})
+                    if way_nodes:
+                        all_ways_nodes.append(way_nodes)
+            create_piste_map(all_ways_nodes, args.resort, "ALL")
 
 
 if __name__ == "__main__":
