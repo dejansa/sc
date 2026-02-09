@@ -132,6 +132,12 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Open a map showing nodes for the selected piste",
     )
+    parser.add_argument(
+        "-f",
+        "--find",
+        default=None,
+        help="Find closest resort and piste to given coordinates (format: lat,lon)",
+    )
     return parser.parse_args()
 
 
@@ -279,13 +285,96 @@ def create_piste_map(
 def main() -> None:
     """Run the primary CLI workflow."""
     args = parse_arguments()
+
+    # Handle --find argument
+    if args.find:
+        coord_str = args.find.strip()
+        if "," not in coord_str:
+            print("wrong coordinates...")
+            return
+        latlon = coord_str.split(",")
+        if len(latlon) != 2:
+            print("wrong coordinates...")
+            return
+        try:
+            lat = float(latlon[0].strip())
+            lon = float(latlon[1].strip())
+        except Exception:
+            print("wrong coordinates...")
+            return
+
+        # Read cache
+        try:
+            with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+        except Exception:
+            print("Cache not found or invalid.")
+            return
+
+        # Find closest resort (use first node of first way for each resort)
+        from math import radians, cos, sin, sqrt, atan2
+        def haversine(lat1, lon1, lat2, lon2):
+            R = 6371.0
+            dlat = radians(lat2 - lat1)
+            dlon = radians(lon2 - lon1)
+            a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+            c = 2 * atan2(sqrt(a), sqrt(1 - a))
+            return R * c
+
+        closest_resort = None
+        closest_resort_dist = float("inf")
+        closest_resort_key = None
+        for resort_key, resort_data in cache_data.items():
+            ways = resort_data.get("ways", [])
+            if not ways:
+                continue
+            first_way = ways[0]
+            nodes = first_way.get("nodes", [])
+            if not nodes:
+                continue
+            node = nodes[0]
+            dist = haversine(lat, lon, float(node["lat"]), float(node["lon"]))
+            if dist < closest_resort_dist:
+                closest_resort_dist = dist
+                closest_resort = resort_data
+                closest_resort_key = resort_key
+
+        if closest_resort is None:
+            print("No resorts found in cache.")
+            return
+        print(f"Closest resort: {closest_resort_key} (distance: {closest_resort_dist:.3f} km)")
+
+        # Find closest piste/way in that resort
+        closest_way = None
+        closest_way_dist = float("inf")
+        closest_way_name = None
+        closest_way_ref = None
+        for way in closest_resort.get("ways", []):
+            if "aerialway" in way or "role" in way:
+                continue
+            nodes = way.get("nodes", [])
+            for node in nodes:
+                dist = haversine(lat, lon, float(node["lat"]), float(node["lon"]))
+                if dist < closest_way_dist:
+                    closest_way_dist = dist
+                    closest_way = way
+        if closest_way:
+            name = closest_way.get("name", "?")
+            ref = closest_way.get("ref") or closest_way.get("piste:ref") or "?"
+            diff = closest_way.get("piste:difficulty", "?")
+            print(f"Closest piste/way: {ref}) {name} (difficulty: {diff}, distance: {closest_way_dist:.3f} km)")
+        else:
+            print("No piste/way found in closest resort.")
+        return
+
+    # ...existing code...
     resort_ways = get_resort_ways(args.resort)
     if args.piste:
         matched_nodes = show_piste_details(resort_ways, args.piste)
         if args.map:
             create_piste_map(matched_nodes, args.resort, args.piste)
     else:
-        # print(f"resort_ways: {resort_ways}")
+        print(f"resort_ways: {resort_ways}")
         show_resort_details(resort_ways)
         if args.map:
             # Collect all way nodes for all pistes in the resort
