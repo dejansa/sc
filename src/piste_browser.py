@@ -131,7 +131,7 @@ def show_piste_details(
     resort_ways: ResortWays, piste_name: str
 ) -> List[Dict[str, float]]:
     """Print selected pistes and return the node coordinates used for mapping."""
-    matched_nodes: List[Dict[str, float]] = []
+    matched_nodes: List[List[Dict[str, float]]] = []
     query_raw = piste_name.strip()
     query = query_raw.lower()
     is_ref_query = query_raw.isdigit()
@@ -153,11 +153,14 @@ def show_piste_details(
             print(f"  {ref_display}) {name}:  dificulty: {difficulty}")
             tags = {k: v for k, v in way.items() if k not in ["type", "nodes"]}
             print(f"    Tags: {tags}")
+            way_nodes = []
             for node in way["nodes"]:
                 lat = float(node["lat"])
                 lon = float(node["lon"])
                 print(f"    Node: lat={lat}, lon={lon}")
-                matched_nodes.append({"lat": lat, "lon": lon})
+                way_nodes.append({"lat": lat, "lon": lon})
+            if way_nodes:
+                matched_nodes.append(way_nodes)
         print()
     return matched_nodes
 
@@ -166,14 +169,15 @@ def create_piste_map(
     nodes: List[Dict[str, float]], resort_name: str, piste_name: str
 ) -> Path | None:
     """Render a small Leaflet map for the nodes and open it in the browser."""
-    if not nodes:
+    if not nodes or not any(nodes):
         print("No nodes were collected for the requested piste; skipping map.")
         return None
     safe_name = "".join(
         c if c.isalnum() else "_" for c in f"{resort_name}_{piste_name}"
     )
-    points = [[float(node["lat"]), float(node["lon"])] for node in nodes]
-    points_js = json.dumps(points)
+    # nodes is now a list of lists (ways), each way is a list of dicts with lat/lon
+    ways_points = [[ [float(node["lat"]), float(node["lon"])] for node in way ] for way in nodes]
+    ways_points_js = json.dumps(ways_points)
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -193,33 +197,44 @@ def create_piste_map(
         width: 100%;
         height: 100vh;
     }}
-</style>
-</head>
-<body>
-<div id=\"map\"></div>
-<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
-<script>
-    const points = {points_js};
-    if (!window.L) {{
-        document.getElementById('map').innerHTML =
-            'Leaflet failed to load. Check network access to unpkg.com.';
-    }} else {{
-        const map = L.map('map');
-        L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-            maxZoom: 19,
-            attribution: '&copy; OpenStreetMap contributors',
-        }}).addTo(map);
+ </style>
+ </head>
+ <body>
+ <div id=\"map\"></div>
+ <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
+ <script>
+     const ways_points = {ways_points_js};
+     if (!window.L) {{
+         document.getElementById('map').innerHTML =
+             'Leaflet failed to load. Check network access to unpkg.com.';
+     }} else {{
+         const map = L.map('map');
+         L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+             maxZoom: 19,
+             attribution: '&copy; OpenStreetMap contributors',
+         }}).addTo(map);
 
-        for (const point of points) {{
-            L.circleMarker(point, {{ radius: 5 }}).addTo(map);
+        // Draw a polyline for each way
+        let allPoints = [];
+        for (const points of ways_points) {{
+            if (points.length > 1) {{
+                L.polyline(points, {{ color: 'blue', weight: 3 }}).addTo(map);
+            }}
+            // Draw circle markers for each point
+            for (const point of points) {{
+                L.circleMarker(point, {{ radius: 5 }}).addTo(map);
+                allPoints.push(point);
+            }}
         }}
 
-        const bounds = L.latLngBounds(points);
-        map.fitBounds(bounds.pad(0.15));
-    }}
-</script>
-</body>
-</html>"""
+        if (allPoints.length > 0) {{
+            const bounds = L.latLngBounds(allPoints);
+            map.fitBounds(bounds.pad(0.15));
+        }}
+     }}
+ </script>
+ </body>
+ </html>"""
     # Use a unique filename per run to avoid browser caching a stale local file.
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -245,6 +260,8 @@ def main() -> None:
         if args.map:
             create_piste_map(matched_nodes, args.resort, args.piste)
     else:
+        # print(f"resort_ways: {json.dumps(resort_ways, indent=2)}")
+        print(f"resort_ways: {resort_ways}")
         show_resort_details(resort_ways)
 
 
