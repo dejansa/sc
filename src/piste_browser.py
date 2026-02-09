@@ -7,11 +7,27 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 DB_PATH = "data/piste/data.db"
+CACHE_PATH = "data/piste/cache.json"
 ResortWays = Dict[str, Dict[str, List[Dict[str, Any]]]]
 
 
 def get_resort_ways(resort_name: str) -> ResortWays:
     """Return a map of resort names to their way metadata."""
+    # Try to load from cache first
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cache_data = {}
+
+    # Resort name may be partial, so check all keys for substring match (case-insensitive)
+    matching_keys = [k for k in cache_data.keys() if resort_name.lower() in k.lower()]
+    if matching_keys:
+        # Return the first matching resort (could be improved to handle multiple)
+        resort_ways = {k: cache_data[k] for k in matching_keys}
+        return resort_ways
+
+    # Not found in cache, do DB search
     resort_ways: ResortWays = {}
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -80,6 +96,16 @@ def get_resort_ways(resort_name: str) -> ResortWays:
                     {"lat": float(node[1]), "lon": float(node[2])}
                 )
     conn.close()
+
+    # Update cache and save
+    try:
+        # Merge with existing cache
+        cache_data.update(resort_ways)
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Warning: failed to update cache: {e}")
+
     return resort_ways
 
 
@@ -259,7 +285,7 @@ def main() -> None:
         if args.map:
             create_piste_map(matched_nodes, args.resort, args.piste)
     else:
-        print(f"resort_ways: {resort_ways}")
+        # print(f"resort_ways: {resort_ways}")
         show_resort_details(resort_ways)
         if args.map:
             # Collect all way nodes for all pistes in the resort
