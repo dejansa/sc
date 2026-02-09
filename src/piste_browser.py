@@ -347,10 +347,12 @@ def main() -> None:
         # Find closest piste/way in that resort
         closest_way = None
         closest_way_dist = float("inf")
-        closest_way_name = None
-        closest_way_ref = None
+        closest_way = None
+        closest_way_dist = float("inf")
         for way in closest_resort.get("ways", []):
             if "aerialway" in way or "role" in way:
+                continue
+            if way.get("piste:type") != "downhill":
                 continue
             nodes = way.get("nodes", [])
             for node in nodes:
@@ -362,12 +364,11 @@ def main() -> None:
             name = closest_way.get("name", "?")
             ref = closest_way.get("ref") or closest_way.get("piste:ref") or "?"
             diff = closest_way.get("piste:difficulty", "?")
+            # print(f"{closest_way=}")
             print(f"Closest piste/way: {ref}) {name} (difficulty: {diff}, distance: {closest_way_dist:.3f} km)")
         else:
             print("No piste/way found in closest resort.")
         return
-
-    # ...existing code...
     resort_ways = get_resort_ways(args.resort)
     if args.piste:
         matched_nodes = show_piste_details(resort_ways, args.piste)
