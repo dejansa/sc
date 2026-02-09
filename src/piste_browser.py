@@ -283,19 +283,33 @@ def create_piste_map(
     return map_path
 
 
-def find_closest_resort_and_piste(coord_value: str) -> None:
-    coord_str = coord_value.strip()
-    if "," not in coord_str:
-        print("wrong coordinates...")
-        return
-    latlon = coord_str.split(",")
-    if len(latlon) != 2:
-        print("wrong coordinates...")
-        return
-    try:
-        lat = float(latlon[0].strip())
-        lon = float(latlon[1].strip())
-    except Exception:
+
+def parse_latlon_list(coord_str: str) -> List[tuple[float, float]]:
+    """
+    Parse a string of coordinates into a list of (lat, lon) tuples.
+    Accepts a single pair or multiple pairs separated by semicolon.
+    Example: '46.3037849,14.5315315' or '46.3037849,14.5315315;46.304,14.532'
+    """
+    coord_str = coord_str.strip()
+    if not coord_str:
+        return []
+    pairs = coord_str.split(";")
+    latlon_list = []
+    for pair in pairs:
+        parts = pair.split(",")
+        if len(parts) != 2:
+            continue
+        try:
+            lat = float(parts[0].strip())
+            lon = float(parts[1].strip())
+            latlon_list.append((lat, lon))
+        except Exception:
+            continue
+    return latlon_list
+
+
+def find_closest_resort_and_piste(latlon_list: List[tuple[float, float]]) -> None:
+    if not latlon_list:
         print("wrong coordinates...")
         return
 
@@ -317,6 +331,8 @@ def find_closest_resort_and_piste(coord_value: str) -> None:
         c = 2 * atan2(sqrt(a), sqrt(1 - a))
         return R * c
 
+    # Use the first coordinate for resort search
+    lat, lon = latlon_list[0]
     closest_resort = None
     closest_resort_dist = float("inf")
     closest_resort_key = None
@@ -340,6 +356,7 @@ def find_closest_resort_and_piste(coord_value: str) -> None:
         return
     print(f"Closest resort: {closest_resort_key} (distance: {closest_resort_dist:.3f} km)")
 
+    # Find closest piste/way in that resort using all coordinates
     closest_way = None
     closest_way_dist = float("inf")
     for way in closest_resort.get("ways", []):
@@ -349,10 +366,11 @@ def find_closest_resort_and_piste(coord_value: str) -> None:
             continue
         nodes = way.get("nodes", [])
         for node in nodes:
-            dist = haversine(lat, lon, float(node["lat"]), float(node["lon"]))
-            if dist < closest_way_dist:
-                closest_way_dist = dist
-                closest_way = way
+            for latq, lonq in latlon_list:
+                dist = haversine(latq, lonq, float(node["lat"]), float(node["lon"]))
+                if dist < closest_way_dist:
+                    closest_way_dist = dist
+                    closest_way = way
     if closest_way:
         name = closest_way.get("name", "?")
         ref = closest_way.get("ref") or closest_way.get("piste:ref") or "?"
@@ -369,7 +387,8 @@ def main() -> None:
 
     # Handle --find argument
     if args.find:
-        find_closest_resort_and_piste(args.find)
+        latlon_list = parse_latlon_list(args.find)
+        find_closest_resort_and_piste(latlon_list)
         return
     resort_ways = get_resort_ways(args.resort)
     if args.piste:
